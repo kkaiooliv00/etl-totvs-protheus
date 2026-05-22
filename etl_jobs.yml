@@ -1,8 +1,6 @@
 jobs:
   - request_id: 4
     target_table: solicitacoes_compras
-  - request_id: 5
-    target_table: custos_fin
   - request_id: 6
     target_table: custos_compras
   - request_id: 14
@@ -49,8 +47,6 @@ jobs:
     target_table: SF5
   - request_id: 40
     target_table: SB2
-  - request_id: 41
-    target_table: SF2
   - request_id: 42
     target_table: SF4
   - request_id: 43
