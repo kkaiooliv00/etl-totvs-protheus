@@ -1,0 +1,57 @@
+jobs:
+  - request_id: 4
+    target_table: solicitacoes_compras
+  - request_id: 5
+    target_table: custos_fin
+  - request_id: 6
+    target_table: custos_compras
+  - request_id: 14
+    target_table: contas_a_receber
+  - request_id: 16
+    target_table: Tempo_medio_pagamento
+  - request_id: 17
+    target_table: SC1
+  - request_id: 18
+    target_table: SC8
+  - request_id: 19
+    target_table: SC7
+  - request_id: 20
+    target_table: SD1
+  - request_id: 21
+    target_table: SF1
+  - request_id: 22
+    target_table: SA2
+  - request_id: 23
+    target_table: SE4
+  - request_id: 24
+    target_table: SYS_COMPANY_FILIAIS
+  - request_id: 26
+    target_table: SBM
+  - request_id: 27
+    target_table: SCR
+  - request_id: 28
+    target_table: DBM
+  - request_id: 29
+    target_table: CTT
+  - request_id: 30
+    target_table: SYS_USR
+  - request_id: 32
+    target_table: SED
+  - request_id: 34
+    target_table: SB1
+  - request_id: 36
+    target_table: SCQ
+  - request_id: 37
+    target_table: D03
+  - request_id: 38
+    target_table: SCP
+  - request_id: 39
+    target_table: SF5
+  - request_id: 40
+    target_table: SB2
+  - request_id: 41
+    target_table: SF2
+  - request_id: 42
+    target_table: SF4
+  - request_id: 43
+    target_table: STF

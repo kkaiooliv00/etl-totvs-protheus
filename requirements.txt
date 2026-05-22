@@ -1,0 +1,6 @@
+pandas
+psycopg[binary]
+python-dotenv
+pyyaml
+requests
+sqlalchemy
