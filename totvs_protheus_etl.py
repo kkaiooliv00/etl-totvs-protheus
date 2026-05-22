@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -31,7 +33,7 @@ DATABASE_URL_ENV = "DATABASE_URL"
 
 JOB_CONFIG_PATH = Path(os.getenv("ETL_JOBS_FILE", "etl_jobs.yml"))
 START_PAGE = 1
-PAGE_SIZE = 25
+PAGE_SIZE = 100
 UPSERT_BATCH_SIZE = 500
 REQUEST_TIMEOUT_SECONDS = 60
 
@@ -334,6 +336,20 @@ def load_to_postgres(engine: Engine, job: EtlJob, dataframe: pd.DataFrame) -> No
     logger.info("%s | Carga concluida em %s.%s.", job.target_table, TARGET_SCHEMA, job.target_table)
 
 
+def chunk_jobs(jobs: list[EtlJob], chunk_index: int, chunk_size: int) -> list[EtlJob]:
+    if chunk_index < 0:
+        raise RuntimeError("chunk_index nao pode ser negativo.")
+    if chunk_size <= 0:
+        raise RuntimeError("chunk_size deve ser maior que zero.")
+    start = chunk_index * chunk_size
+    return jobs[start : start + chunk_size]
+
+
+def chunk_matrix(jobs: list[EtlJob], chunk_size: int) -> str:
+    chunk_count = (len(jobs) + chunk_size - 1) // chunk_size
+    return json.dumps({"chunk_index": list(range(chunk_count))}, separators=(",", ":"))
+
+
 def run_job(engine: Engine, job: EtlJob) -> None:
     logger.info("Iniciando job request_id=%s target_table=%s.", job.request_id, job.target_table)
     records = extract_from_api(job)
@@ -341,10 +357,29 @@ def run_job(engine: Engine, job: EtlJob) -> None:
     load_to_postgres(engine, job, dataframe)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Executa jobs ETL TOTVS configurados no YAML.")
+    parser.add_argument("--chunk-index", type=int, default=0)
+    parser.add_argument("--chunk-size", type=int, default=5)
+    parser.add_argument("--print-chunk-matrix", action="store_true")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    jobs = load_jobs()
+    if args.print_chunk_matrix:
+        print(chunk_matrix(jobs, args.chunk_size))
+        return
+
+    selected_jobs = chunk_jobs(jobs, args.chunk_index, args.chunk_size)
+    if not selected_jobs:
+        logger.info("Bloco %s sem jobs; nada a executar.", args.chunk_index)
+        return
+
     engine = create_engine(require_postgres_database_url(), pool_pre_ping=True)
     try:
-        for job in load_jobs():
+        for job in selected_jobs:
             run_job(engine, job)
     except (KeyError, RuntimeError):
         logger.exception("Pipeline interrompido por configuracao ou dados invalidos.")
