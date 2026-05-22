@@ -7,18 +7,22 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import yaml
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
+from requests.adapters import HTTPAdapter
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
+from urllib3.util.retry import Retry
 
 
 load_dotenv()
@@ -36,6 +40,8 @@ START_PAGE = 1
 PAGE_SIZE = 100
 UPSERT_BATCH_SIZE = 500
 REQUEST_TIMEOUT_SECONDS = 60
+REQUEST_RETRY_COUNT = 3
+BUSINESS_TIMEZONE = ZoneInfo("America/Fortaleza")
 
 TARGET_SCHEMA = "totvs"
 BUSINESS_KEY = "super_chave"
@@ -52,6 +58,8 @@ logger = logging.getLogger("totvs_protheus_etl")
 class EtlJob:
     request_id: int
     target_table: str
+    date_parameter: str | None = None
+    business_key: str = BUSINESS_KEY
 
     @property
     def staging_table(self) -> str:
@@ -95,6 +103,8 @@ def load_jobs() -> list[EtlJob]:
         try:
             request_id = int(raw_job["request_id"])
             target_table = str(raw_job["target_table"]).strip()
+            date_parameter = raw_job.get("date_parameter")
+            business_key = str(raw_job.get("business_key", BUSINESS_KEY)).strip()
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"Job invalido em {JOB_CONFIG_PATH}: {raw_job!r}"
@@ -102,7 +112,20 @@ def load_jobs() -> list[EtlJob]:
 
         if not target_table:
             raise RuntimeError("target_table nao pode ser vazio.")
-        jobs.append(EtlJob(request_id=request_id, target_table=target_table))
+        if not business_key:
+            raise RuntimeError(f"business_key vazio em {target_table}.")
+        if date_parameter is not None:
+            date_parameter = str(date_parameter).strip()
+            if not date_parameter:
+                raise RuntimeError(f"date_parameter vazio em {target_table}.")
+        jobs.append(
+            EtlJob(
+                request_id=request_id,
+                target_table=target_table,
+                date_parameter=date_parameter,
+                business_key=business_key,
+            )
+        )
 
     return jobs
 
@@ -142,18 +165,45 @@ def extract_items(payload: Any) -> list[dict[str, Any]]:
     raise ValueError("Nao foi possivel localizar os registros no JSON da API.")
 
 
-def extract_from_api(job: EtlJob) -> list[dict[str, Any]]:
+def format_start_date(lookback_days: int) -> str:
+    if lookback_days <= 0:
+        raise RuntimeError("lookback_days deve ser maior que zero.")
+    current_date = datetime.now(BUSINESS_TIMEZONE).date()
+    return (current_date - timedelta(days=lookback_days)).strftime("%Y%m%d")
+
+
+def request_data(job: EtlJob, page: int, lookback_days: int) -> dict[str, Any]:
+    data: dict[str, Any] = {"page": page, "pageSize": PAGE_SIZE}
+    if job.date_parameter:
+        data[job.date_parameter] = format_start_date(lookback_days)
+    return data
+
+
+def build_api_session() -> requests.Session:
+    retry = Retry(
+        total=REQUEST_RETRY_COUNT,
+        connect=REQUEST_RETRY_COUNT,
+        read=REQUEST_RETRY_COUNT,
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods={"POST"},
+    )
+    session = requests.Session()
+    session.auth = HTTPBasicAuth(API_USER, require_env(API_PASSWORD_ENV))
+    session.headers.update({"Content-Type": "application/json"})
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def extract_from_api(job: EtlJob, lookback_days: int) -> list[dict[str, Any]]:
     page = START_PAGE
     records: list[dict[str, Any]] = []
 
-    with requests.Session() as session:
-        session.auth = HTTPBasicAuth(API_USER, require_env(API_PASSWORD_ENV))
-        session.headers.update({"Content-Type": "application/json"})
-
+    with build_api_session() as session:
         while True:
             body = {
                 "id": job.request_id,
-                "data": {"page": page, "pageSize": PAGE_SIZE},
+                "data": request_data(job, page, lookback_days),
             }
 
             try:
@@ -162,6 +212,14 @@ def extract_from_api(job: EtlJob) -> list[dict[str, Any]]:
                     json=body,
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
+                if response.status_code >= 400:
+                    logger.error(
+                        "%s | API retornou HTTP %s na pagina %s. Resposta: %s",
+                        job.target_table,
+                        response.status_code,
+                        page,
+                        response.text[:1000],
+                    )
                 response.raise_for_status()
                 page_items = extract_items(response.json())
             except requests.RequestException:
@@ -207,14 +265,14 @@ def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFram
 
     if dataframe.empty:
         return dataframe
-    if BUSINESS_KEY not in dataframe.columns:
+    if job.business_key not in dataframe.columns:
         received_columns = ", ".join(str(column) for column in dataframe.columns)
         raise KeyError(
-            f"Coluna obrigatoria ausente: {BUSINESS_KEY}. "
+            f"Coluna obrigatoria ausente: {job.business_key}. "
             f"Colunas recebidas em {job.target_table}: {received_columns}"
         )
 
-    dataframe = dataframe.drop_duplicates(subset=[BUSINESS_KEY], keep="last")
+    dataframe = dataframe.drop_duplicates(subset=[job.business_key], keep="last")
     logger.info("%s | Registros depois da deduplicacao: %s.", job.target_table, len(dataframe))
     return dataframe
 
@@ -250,25 +308,42 @@ def add_missing_target_columns(connection: Connection, engine: Engine, job: EtlJ
 
 def ensure_unique_constraint(connection: Connection, job: EtlJob) -> None:
     target = qualified_table(TARGET_SCHEMA, job.target_table)
-    constraint = quote_identifier(f"{job.target_table}_{BUSINESS_KEY}_uk")
-    key = quote_identifier(BUSINESS_KEY)
-    connection.execute(
+    constraint_name = f"{job.target_table}_{job.business_key}_uk"
+    constraint = quote_identifier(constraint_name)
+    key = quote_identifier(job.business_key)
+
+    constraint_exists = connection.execute(
         text(
-            f"""
-            DO $$
-            BEGIN
-                ALTER TABLE {target} ADD CONSTRAINT {constraint} UNIQUE ({key});
-            EXCEPTION
-                WHEN duplicate_object THEN NULL;
-            END $$;
             """
-        )
-    )
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_info
+                JOIN pg_class table_info
+                    ON table_info.oid = constraint_info.conrelid
+                JOIN pg_namespace schema_info
+                    ON schema_info.oid = table_info.relnamespace
+                WHERE constraint_info.conname = :constraint_name
+                    AND table_info.relname = :target_table
+                    AND schema_info.nspname = :target_schema
+            )
+            """
+        ),
+        {
+            "constraint_name": constraint_name,
+            "target_table": job.target_table,
+            "target_schema": TARGET_SCHEMA,
+        },
+    ).scalar_one()
+
+    if constraint_exists:
+        return
+
+    connection.execute(text(f"ALTER TABLE {target} ADD CONSTRAINT {constraint} UNIQUE ({key})"))
 
 
 def build_upsert_sql(job: EtlJob, columns: list[str]) -> str:
     quoted_columns = ", ".join(quote_identifier(column) for column in columns)
-    update_columns = [column for column in columns if column != BUSINESS_KEY]
+    update_columns = [column for column in columns if column != job.business_key]
     if update_columns:
         assignments = ", ".join(
             f"{quote_identifier(column)} = EXCLUDED.{quote_identifier(column)}"
@@ -286,7 +361,7 @@ def build_upsert_sql(job: EtlJob, columns: list[str]) -> str:
         ORDER BY ctid
         LIMIT :batch_size
         OFFSET :offset
-        ON CONFLICT ({quote_identifier(BUSINESS_KEY)}) {conflict_action}
+        ON CONFLICT ({quote_identifier(job.business_key)}) {conflict_action}
     """
 
 
@@ -350,9 +425,9 @@ def chunk_matrix(jobs: list[EtlJob], chunk_size: int) -> str:
     return json.dumps({"chunk_index": list(range(chunk_count))}, separators=(",", ":"))
 
 
-def run_job(engine: Engine, job: EtlJob) -> None:
+def run_job(engine: Engine, job: EtlJob, lookback_days: int) -> None:
     logger.info("Iniciando job request_id=%s target_table=%s.", job.request_id, job.target_table)
-    records = extract_from_api(job)
+    records = extract_from_api(job, lookback_days)
     dataframe = transform_records(job, records)
     load_to_postgres(engine, job, dataframe)
 
@@ -361,6 +436,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Executa jobs ETL TOTVS configurados no YAML.")
     parser.add_argument("--chunk-index", type=int, default=0)
     parser.add_argument("--chunk-size", type=int, default=5)
+    parser.add_argument("--lookback-days", type=int, default=30)
     parser.add_argument("--print-chunk-matrix", action="store_true")
     return parser.parse_args()
 
@@ -378,9 +454,21 @@ def main() -> None:
         return
 
     engine = create_engine(require_postgres_database_url(), pool_pre_ping=True)
+    failed_jobs: list[str] = []
     try:
         for job in selected_jobs:
-            run_job(engine, job)
+            try:
+                run_job(engine, job, args.lookback_days)
+            except Exception:
+                logger.exception(
+                    "Job request_id=%s target_table=%s falhou.",
+                    job.request_id,
+                    job.target_table,
+                )
+                failed_jobs.append(job.target_table)
+
+        if failed_jobs:
+            raise RuntimeError(f"Jobs com falha no bloco: {', '.join(failed_jobs)}")
     except (KeyError, RuntimeError):
         logger.exception("Pipeline interrompido por configuracao ou dados invalidos.")
         raise

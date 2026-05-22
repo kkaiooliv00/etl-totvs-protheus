@@ -2,9 +2,16 @@ name: ETL TOTVS Protheus
 
 on:
   workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: Dias para atualizar os jobs com filtro de data
+        required: true
+        default: "30"
   schedule:
-    # GitHub cron uses UTC. This runs every 4 hours.
+    # GitHub cron uses UTC. Every 4 hours with 30 days of history.
     - cron: "7 */4 * * *"
+    # Daily with 60 days of history.
+    - cron: "23 3 * * *"
 
 permissions:
   contents: read
@@ -29,7 +36,7 @@ jobs:
 
       - name: Build job chunks
         id: matrix
-        run: echo "matrix=$(python totvs_protheus_etl.py --print-chunk-matrix --chunk-size 5)" >> "$GITHUB_OUTPUT"
+        run: echo "matrix=$(python totvs_protheus_etl.py --print-chunk-matrix --chunk-size 1)" >> "$GITHUB_OUTPUT"
 
   run-etl:
     needs: build-matrix
@@ -54,4 +61,5 @@ jobs:
         env:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python totvs_protheus_etl.py --chunk-index ${{ matrix.chunk_index }} --chunk-size 5
+          LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || github.event.schedule == '23 3 * * *' && '60' || '30' }}
+        run: python totvs_protheus_etl.py --chunk-index ${{ matrix.chunk_index }} --chunk-size 1 --lookback-days "$LOOKBACK_DAYS"
