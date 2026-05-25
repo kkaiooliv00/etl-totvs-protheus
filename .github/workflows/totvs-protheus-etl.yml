@@ -8,10 +8,10 @@ on:
         required: true
         default: "0"
   schedule:
-    # GitHub cron uses UTC. Every 8 hours with 30 days of history.
-    - cron: "7 */8 * * *"
-    # Daily with 60 days of history.
-    - cron: "23 3 * * *"
+    # GitHub cron uses UTC. Runs at 13:00 America/Fortaleza with 30 days of history.
+    - cron: "0 16 * * *"
+    # Runs daily at 02:00 America/Fortaleza with 60 days of history.
+    - cron: "0 5 * * *"
 
 permissions:
   contents: read
@@ -41,5 +41,5 @@ jobs:
         env:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || github.event.schedule == '23 3 * * *' && '60' || '30' }}
+          LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || github.event.schedule == '0 5 * * *' && '60' || '30' }}
         run: python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS"
