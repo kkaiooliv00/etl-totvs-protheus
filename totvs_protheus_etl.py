@@ -42,6 +42,7 @@ PAGE_SIZE = 100
 DB_WRITE_CHUNK_SIZE = 1000
 STAGING_FLUSH_RECORDS = 5000
 UPSERT_BATCH_SIZE = 5000
+POSTGRES_PARAMETER_LIMIT = 60000
 REQUEST_TIMEOUT_SECONDS = 60
 REQUEST_RETRY_COUNT = 3
 PAGE_LOG_INTERVAL = 10
@@ -64,6 +65,7 @@ class EtlJob:
     target_table: str
     date_parameter: str | None = None
     business_key: str = BUSINESS_KEY
+    business_key_columns: tuple[str, ...] = ()
 
     @property
     def staging_table(self) -> str:
@@ -83,13 +85,26 @@ def require_env(name: str) -> str:
 
 def require_postgres_database_url() -> str:
     database_url = require_env(DATABASE_URL_ENV)
-    scheme = urlparse(database_url).scheme
+    try:
+        parsed_url = urlparse(database_url)
+    except ValueError as exc:
+        raise RuntimeError(
+            "DATABASE_URL invalida. Verifique se o host nao esta entre colchetes "
+            "e se caracteres especiais da senha estao codificados, por exemplo @ como %40."
+        ) from exc
+
+    scheme = parsed_url.scheme
     if scheme not in ("postgresql", "postgresql+psycopg", "postgres"):
         raise RuntimeError(
             "DATABASE_URL invalida. Use uma URL PostgreSQL como "
             "postgresql+psycopg://usuario:senha@host:5432/postgres."
         )
     return database_url
+
+
+def preflight_database_connection(engine: Engine) -> None:
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
 
 
 def load_jobs() -> list[EtlJob]:
@@ -113,6 +128,7 @@ def load_jobs() -> list[EtlJob]:
             target_table = str(raw_job["target_table"]).strip()
             date_parameter = raw_job.get("date_parameter")
             business_key = str(raw_job.get("business_key", BUSINESS_KEY)).strip()
+            raw_business_key_columns = raw_job.get("business_key_columns") or []
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"Job invalido em {JOB_CONFIG_PATH}: {raw_job!r}"
@@ -126,12 +142,18 @@ def load_jobs() -> list[EtlJob]:
             date_parameter = str(date_parameter).strip()
             if not date_parameter:
                 raise RuntimeError(f"date_parameter vazio em {target_table}.")
+        if not isinstance(raw_business_key_columns, list):
+            raise RuntimeError(f"business_key_columns deve ser uma lista em {target_table}.")
+        business_key_columns = tuple(
+            str(column).strip() for column in raw_business_key_columns if str(column).strip()
+        )
         jobs.append(
             EtlJob(
                 request_id=request_id,
                 target_table=target_table,
                 date_parameter=date_parameter,
                 business_key=business_key,
+                business_key_columns=business_key_columns,
             )
         )
 
@@ -269,6 +291,22 @@ def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFram
 
     if dataframe.empty:
         return dataframe
+    if job.business_key not in dataframe.columns and job.business_key_columns:
+        missing_columns = [
+            column for column in job.business_key_columns if column not in dataframe.columns
+        ]
+        if missing_columns:
+            raise KeyError(
+                f"Colunas para chave composta ausentes em {job.target_table}: "
+                f"{', '.join(missing_columns)}"
+            )
+        dataframe[job.business_key] = (
+            dataframe.loc[:, list(job.business_key_columns)]
+            .fillna("")
+            .astype(str)
+            .agg("|".join, axis=1)
+        )
+
     if job.business_key not in dataframe.columns:
         received_columns = ", ".join(str(column) for column in dataframe.columns)
         raise KeyError(
@@ -424,13 +462,24 @@ def write_page_to_staging(
     if dataframe.empty:
         return
 
+    safe_chunksize = max(
+        1,
+        min(DB_WRITE_CHUNK_SIZE, POSTGRES_PARAMETER_LIMIT // max(len(dataframe.columns), 1)),
+    )
+    logger.info(
+        "%s | Enviando %s registros para staging em lotes de ate %s linhas.",
+        job.target_table,
+        len(dataframe),
+        safe_chunksize,
+    )
+
     dataframe.to_sql(
         job.staging_table,
         engine,
         schema=TARGET_SCHEMA,
         if_exists=if_exists,
         index=False,
-        chunksize=DB_WRITE_CHUNK_SIZE,
+        chunksize=safe_chunksize,
         method="multi",
     )
 
@@ -585,10 +634,14 @@ def main() -> None:
 
     engine = create_engine(require_postgres_database_url(), pool_pre_ping=True)
     failed_jobs: list[str] = []
+    succeeded_jobs: list[str] = []
     try:
+        preflight_database_connection(engine)
+
         for job in selected_jobs:
             try:
                 run_job(engine, job, lookback_days)
+                succeeded_jobs.append(job.target_table)
             except Exception:
                 logger.exception(
                     "Job request_id=%s target_table=%s falhou.",
@@ -596,6 +649,14 @@ def main() -> None:
                     job.target_table,
                 )
                 failed_jobs.append(job.target_table)
+
+        logger.info(
+            "Resumo da execucao: %s jobs com sucesso, %s jobs com falha.",
+            len(succeeded_jobs),
+            len(failed_jobs),
+        )
+        if failed_jobs:
+            logger.error("Jobs com falha: %s", ", ".join(failed_jobs))
 
         if failed_jobs:
             raise RuntimeError(f"Jobs com falha no bloco: {', '.join(failed_jobs)}")
