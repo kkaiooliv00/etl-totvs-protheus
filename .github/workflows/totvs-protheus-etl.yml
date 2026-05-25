@@ -4,46 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       lookback_days:
-        description: Dias para atualizar os jobs com filtro de data
+        description: Dias para atualizar os jobs com filtro de data. Use 0 para carga total.
         required: true
-        default: "30"
+        default: "0"
   schedule:
-    # GitHub cron uses UTC. Every 4 hours with 30 days of history.
-    - cron: "7 */4 * * *"
+    # GitHub cron uses UTC. Every 8 hours with 30 days of history.
+    - cron: "7 */8 * * *"
     # Daily with 60 days of history.
     - cron: "23 3 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: etl-totvs-protheus
+  cancel-in-progress: true
+
 jobs:
-  build-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Build job chunks
-        id: matrix
-        run: echo "matrix=$(python totvs_protheus_etl.py --print-chunk-matrix --chunk-size 1)" >> "$GITHUB_OUTPUT"
-
   run-etl:
-    needs: build-matrix
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.build-matrix.outputs.matrix) }}
+    timeout-minutes: 240
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,11 +35,11 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Run ETL
         env:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || github.event.schedule == '23 3 * * *' && '60' || '30' }}
-        run: python totvs_protheus_etl.py --chunk-index ${{ matrix.chunk_index }} --chunk-size 1 --lookback-days "$LOOKBACK_DAYS"
+        run: python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS"

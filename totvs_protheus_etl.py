@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -38,9 +39,12 @@ DATABASE_URL_ENV = "DATABASE_URL"
 JOB_CONFIG_PATH = Path(os.getenv("ETL_JOBS_FILE", "etl_jobs.yml"))
 START_PAGE = 1
 PAGE_SIZE = 100
-UPSERT_BATCH_SIZE = 500
+DB_WRITE_CHUNK_SIZE = 1000
+STAGING_FLUSH_RECORDS = 5000
+UPSERT_BATCH_SIZE = 5000
 REQUEST_TIMEOUT_SECONDS = 60
 REQUEST_RETRY_COUNT = 3
+PAGE_LOG_INTERVAL = 10
 BUSINESS_TIMEZONE = ZoneInfo("America/Fortaleza")
 
 TARGET_SCHEMA = "totvs"
@@ -64,6 +68,10 @@ class EtlJob:
     @property
     def staging_table(self) -> str:
         return f"{self.target_table}_staging"
+
+    @property
+    def dedup_staging_table(self) -> str:
+        return f"{self.target_table}_staging_dedup"
 
 
 def require_env(name: str) -> str:
@@ -165,16 +173,16 @@ def extract_items(payload: Any) -> list[dict[str, Any]]:
     raise ValueError("Nao foi possivel localizar os registros no JSON da API.")
 
 
-def format_start_date(lookback_days: int) -> str:
-    if lookback_days <= 0:
+def format_start_date(lookback_days: int | None) -> str:
+    if lookback_days is None or lookback_days <= 0:
         raise RuntimeError("lookback_days deve ser maior que zero.")
     current_date = datetime.now(BUSINESS_TIMEZONE).date()
     return (current_date - timedelta(days=lookback_days)).strftime("%Y%m%d")
 
 
-def request_data(job: EtlJob, page: int, lookback_days: int) -> dict[str, Any]:
+def request_data(job: EtlJob, page: int, lookback_days: int | None) -> dict[str, Any]:
     data: dict[str, Any] = {"page": page, "pageSize": PAGE_SIZE}
-    if job.date_parameter:
+    if job.date_parameter and lookback_days is not None:
         data[job.date_parameter] = format_start_date(lookback_days)
     return data
 
@@ -195,9 +203,8 @@ def build_api_session() -> requests.Session:
     return session
 
 
-def extract_from_api(job: EtlJob, lookback_days: int) -> list[dict[str, Any]]:
+def iter_api_pages(job: EtlJob, lookback_days: int | None):
     page = START_PAGE
-    records: list[dict[str, Any]] = []
 
     with build_api_session() as session:
         while True:
@@ -237,31 +244,28 @@ def extract_from_api(job: EtlJob, lookback_days: int) -> list[dict[str, Any]]:
                 )
                 raise
 
-            logger.info(
-                "%s | Pagina %s extraida com %s registros.",
-                job.target_table,
-                page,
-                len(page_items),
-            )
+            if page == START_PAGE or page % PAGE_LOG_INTERVAL == 0 or len(page_items) < PAGE_SIZE:
+                logger.info(
+                    "%s | Pagina %s extraida com %s registros.",
+                    job.target_table,
+                    page,
+                    len(page_items),
+                )
             if len(page_items) > PAGE_SIZE:
                 raise ValueError(
                     f"{job.target_table} retornou {len(page_items)} registros "
                     f"na pagina {page}; pageSize solicitado: {PAGE_SIZE}."
                 )
 
-            records.extend(page_items)
+            yield page, page_items
             if not page_items or len(page_items) < PAGE_SIZE:
                 logger.info("%s | Paginacao encerrada na pagina %s.", job.target_table, page)
                 break
             page += 1
 
-    logger.info("%s | Extracao concluida com %s registros.", job.target_table, len(records))
-    return records
-
 
 def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFrame:
     dataframe = pd.json_normalize(records, sep="_")
-    logger.info("%s | Registros antes da deduplicacao: %s.", job.target_table, len(dataframe))
 
     if dataframe.empty:
         return dataframe
@@ -273,7 +277,6 @@ def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFram
         )
 
     dataframe = dataframe.drop_duplicates(subset=[job.business_key], keep="last")
-    logger.info("%s | Registros depois da deduplicacao: %s.", job.target_table, len(dataframe))
     return dataframe
 
 
@@ -285,6 +288,11 @@ def create_target_from_staging(connection: Connection, job: EtlJob) -> None:
     target = qualified_table(TARGET_SCHEMA, job.target_table)
     staging = qualified_table(TARGET_SCHEMA, job.staging_table)
     connection.execute(text(f"CREATE TABLE IF NOT EXISTS {target} AS TABLE {staging} WITH NO DATA"))
+
+
+def drop_staging_tables(connection: Connection, job: EtlJob) -> None:
+    connection.execute(text(f"DROP TABLE IF EXISTS {qualified_table(TARGET_SCHEMA, job.dedup_staging_table)}"))
+    connection.execute(text(f"DROP TABLE IF EXISTS {qualified_table(TARGET_SCHEMA, job.staging_table)}"))
 
 
 def add_missing_target_columns(connection: Connection, engine: Engine, job: EtlJob) -> None:
@@ -341,6 +349,33 @@ def ensure_unique_constraint(connection: Connection, job: EtlJob) -> None:
     connection.execute(text(f"ALTER TABLE {target} ADD CONSTRAINT {constraint} UNIQUE ({key})"))
 
 
+def build_dedup_staging_sql(job: EtlJob, columns: list[str]) -> str:
+    quoted_columns = ", ".join(quote_identifier(column) for column in columns)
+    source = qualified_table(TARGET_SCHEMA, job.staging_table)
+    dedup = qualified_table(TARGET_SCHEMA, job.dedup_staging_table)
+    key = quote_identifier(job.business_key)
+
+    return f"""
+        CREATE TABLE {dedup} AS
+        SELECT {quoted_columns}
+        FROM (
+            SELECT
+                {quoted_columns},
+                ROW_NUMBER() OVER (
+                    PARTITION BY {key}
+                    ORDER BY ctid DESC
+                ) AS __etl_row_number
+            FROM {source}
+        ) dedup_source
+        WHERE __etl_row_number = 1
+    """
+
+
+def create_dedup_staging(connection: Connection, job: EtlJob, columns: list[str]) -> None:
+    connection.execute(text(f"DROP TABLE IF EXISTS {qualified_table(TARGET_SCHEMA, job.dedup_staging_table)}"))
+    connection.execute(text(build_dedup_staging_sql(job, columns)))
+
+
 def build_upsert_sql(job: EtlJob, columns: list[str]) -> str:
     quoted_columns = ", ".join(quote_identifier(column) for column in columns)
     update_columns = [column for column in columns if column != job.business_key]
@@ -356,7 +391,7 @@ def build_upsert_sql(job: EtlJob, columns: list[str]) -> str:
     return f"""
         INSERT INTO {qualified_table(TARGET_SCHEMA, job.target_table)} ({quoted_columns})
         SELECT {quoted_columns}
-        FROM {qualified_table(TARGET_SCHEMA, job.staging_table)}
+        FROM {qualified_table(TARGET_SCHEMA, job.dedup_staging_table)}
         WHERE TRUE
         ORDER BY ctid
         LIMIT :batch_size
@@ -366,7 +401,7 @@ def build_upsert_sql(job: EtlJob, columns: list[str]) -> str:
 
 
 def upsert_staging_in_batches(connection: Connection, job: EtlJob, columns: list[str]) -> None:
-    staging = qualified_table(TARGET_SCHEMA, job.staging_table)
+    staging = qualified_table(TARGET_SCHEMA, job.dedup_staging_table)
     staging_count = connection.execute(text(f"SELECT COUNT(*) FROM {staging}")).scalar_one()
     upsert_sql = text(build_upsert_sql(job, columns))
 
@@ -380,35 +415,48 @@ def upsert_staging_in_batches(connection: Connection, job: EtlJob, columns: list
         )
 
 
-def load_to_postgres(engine: Engine, job: EtlJob, dataframe: pd.DataFrame) -> None:
+def write_page_to_staging(
+    engine: Engine,
+    job: EtlJob,
+    dataframe: pd.DataFrame,
+    if_exists: str,
+) -> None:
     if dataframe.empty:
-        logger.info("%s | DataFrame vazio; carga dispensada.", job.target_table)
         return
 
-    try:
-        with engine.begin() as connection:
-            create_schema(connection)
+    dataframe.to_sql(
+        job.staging_table,
+        engine,
+        schema=TARGET_SCHEMA,
+        if_exists=if_exists,
+        index=False,
+        chunksize=DB_WRITE_CHUNK_SIZE,
+        method="multi",
+    )
 
-        dataframe.to_sql(
-            job.staging_table,
-            engine,
-            schema=TARGET_SCHEMA,
-            if_exists="replace",
-            index=False,
-            chunksize=PAGE_SIZE,
-            method="multi",
-        )
-        with engine.begin() as connection:
-            create_target_from_staging(connection, job)
-            add_missing_target_columns(connection, engine, job)
-            ensure_unique_constraint(connection, job)
-            upsert_staging_in_batches(connection, job, list(dataframe.columns))
-            connection.execute(text(f"DROP TABLE IF EXISTS {qualified_table(TARGET_SCHEMA, job.staging_table)}"))
-    except SQLAlchemyError:
-        logger.exception("%s | Falha durante a carga no PostgreSQL.", job.target_table)
-        raise
 
-    logger.info("%s | Carga concluida em %s.%s.", job.target_table, TARGET_SCHEMA, job.target_table)
+def flush_staging_buffer(
+    engine: Engine,
+    job: EtlJob,
+    buffer_frames: list[pd.DataFrame],
+    if_exists: str,
+) -> tuple[int, str]:
+    if not buffer_frames:
+        return 0, if_exists
+
+    dataframe = pd.concat(buffer_frames, ignore_index=True)
+    write_page_to_staging(engine, job, dataframe, if_exists)
+    return len(dataframe), "append"
+
+
+def finalize_load(engine: Engine, job: EtlJob, columns: list[str]) -> None:
+    with engine.begin() as connection:
+        create_target_from_staging(connection, job)
+        add_missing_target_columns(connection, engine, job)
+        ensure_unique_constraint(connection, job)
+        create_dedup_staging(connection, job, columns)
+        upsert_staging_in_batches(connection, job, columns)
+        drop_staging_tables(connection, job)
 
 
 def chunk_jobs(jobs: list[EtlJob], chunk_index: int, chunk_size: int) -> list[EtlJob]:
@@ -425,24 +473,106 @@ def chunk_matrix(jobs: list[EtlJob], chunk_size: int) -> str:
     return json.dumps({"chunk_index": list(range(chunk_count))}, separators=(",", ":"))
 
 
-def run_job(engine: Engine, job: EtlJob, lookback_days: int) -> None:
+def run_job(engine: Engine, job: EtlJob, lookback_days: int | None) -> None:
+    started_at = time.perf_counter()
     logger.info("Iniciando job request_id=%s target_table=%s.", job.request_id, job.target_table)
-    records = extract_from_api(job, lookback_days)
-    dataframe = transform_records(job, records)
-    load_to_postgres(engine, job, dataframe)
+
+    extracted_records = 0
+    staged_records = 0
+    processed_pages = 0
+    columns: list[str] | None = None
+    staging_mode = "replace"
+    buffer_frames: list[pd.DataFrame] = []
+    buffer_records = 0
+
+    try:
+        with engine.begin() as connection:
+            create_schema(connection)
+            drop_staging_tables(connection, job)
+
+        for page, records in iter_api_pages(job, lookback_days):
+            processed_pages = page
+            extracted_records += len(records)
+            if not records:
+                continue
+
+            dataframe = transform_records(job, records)
+            if dataframe.empty:
+                continue
+
+            if columns is None:
+                columns = list(dataframe.columns)
+            buffer_frames.append(dataframe)
+            buffer_records += len(dataframe)
+
+            if buffer_records >= STAGING_FLUSH_RECORDS:
+                flushed_records, staging_mode = flush_staging_buffer(
+                    engine,
+                    job,
+                    buffer_frames,
+                    staging_mode,
+                )
+                staged_records += flushed_records
+                buffer_frames.clear()
+                buffer_records = 0
+
+            if page == START_PAGE or page % PAGE_LOG_INTERVAL == 0:
+                logger.info(
+                    "%s | Progresso: %s paginas, %s registros extraidos, %s enviados a staging.",
+                    job.target_table,
+                    page,
+                    extracted_records,
+                    staged_records,
+                )
+
+        if columns is None:
+            logger.info("%s | Nenhum registro retornado; carga dispensada.", job.target_table)
+            return
+
+        flushed_records, staging_mode = flush_staging_buffer(
+            engine,
+            job,
+            buffer_frames,
+            staging_mode,
+        )
+        staged_records += flushed_records
+        buffer_frames.clear()
+
+        finalize_load(engine, job, columns)
+    except SQLAlchemyError:
+        logger.exception("%s | Falha durante a carga no PostgreSQL.", job.target_table)
+        raise
+
+    elapsed_seconds = time.perf_counter() - started_at
+    logger.info(
+        "%s | Carga concluida em %s.%s. Paginas=%s extraidos=%s staging=%s tempo=%.1fs.",
+        job.target_table,
+        TARGET_SCHEMA,
+        job.target_table,
+        processed_pages,
+        extracted_records,
+        staged_records,
+        elapsed_seconds,
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Executa jobs ETL TOTVS configurados no YAML.")
     parser.add_argument("--chunk-index", type=int, default=0)
-    parser.add_argument("--chunk-size", type=int, default=5)
-    parser.add_argument("--lookback-days", type=int, default=30)
+    parser.add_argument("--chunk-size", type=int, default=1000)
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=30,
+        help="Dias para filtro incremental. Use 0 para carga total sem filtro de data.",
+    )
     parser.add_argument("--print-chunk-matrix", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    lookback_days = None if args.lookback_days == 0 else args.lookback_days
     jobs = load_jobs()
     if args.print_chunk_matrix:
         print(chunk_matrix(jobs, args.chunk_size))
@@ -458,7 +588,7 @@ def main() -> None:
     try:
         for job in selected_jobs:
             try:
-                run_job(engine, job, args.lookback_days)
+                run_job(engine, job, lookback_days)
             except Exception:
                 logger.exception(
                     "Job request_id=%s target_table=%s falhou.",
