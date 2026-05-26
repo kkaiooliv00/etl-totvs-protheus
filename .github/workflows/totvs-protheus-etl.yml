@@ -10,7 +10,6 @@ on:
       request_id:
         description: ID da API para executar apenas uma tabela. Deixe vazio para rodar todas.
         required: false
-        default: ""
   schedule:
     # GitHub cron uses UTC. Runs at 13:00 America/Fortaleza with 30 days of history.
     - cron: "0 16 * * *"
@@ -46,10 +45,9 @@ jobs:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || github.event.schedule == '0 5 * * *' && '60' || '30' }}
-          REQUEST_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.request_id || '' }}
         run: |
           COMMAND=(python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS")
-          if [ -n "$REQUEST_ID" ]; then
-            COMMAND+=(--request-id "$REQUEST_ID")
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.request_id }}" ]; then
+            COMMAND+=(--request-id "${{ inputs.request_id }}")
           fi
           "${COMMAND[@]}"
