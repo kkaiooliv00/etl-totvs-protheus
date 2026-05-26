@@ -533,6 +533,33 @@ def filter_jobs_by_request_id(jobs: list[EtlJob], request_id: int | None) -> lis
     return selected_jobs
 
 
+def parse_request_id_list(raw_request_ids: str | None) -> set[int]:
+    if not raw_request_ids:
+        return set()
+
+    request_ids: set[int] = set()
+    for raw_request_id in raw_request_ids.split(","):
+        raw_request_id = raw_request_id.strip()
+        if not raw_request_id:
+            continue
+        try:
+            request_id = int(raw_request_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Lista de request_ids invalida: {raw_request_ids!r}"
+            ) from exc
+        if request_id < 0:
+            raise RuntimeError("request_ids para exclusao nao podem ser negativos.")
+        request_ids.add(request_id)
+    return request_ids
+
+
+def exclude_jobs_by_request_ids(jobs: list[EtlJob], request_ids: set[int]) -> list[EtlJob]:
+    if not request_ids:
+        return jobs
+    return [job for job in jobs if job.request_id not in request_ids]
+
+
 def chunk_matrix(jobs: list[EtlJob], chunk_size: int) -> str:
     chunk_count = (len(jobs) + chunk_size - 1) // chunk_size
     return json.dumps({"chunk_index": list(range(chunk_count))}, separators=(",", ":"))
@@ -637,6 +664,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Executa apenas o job com este request_id. Use 0 para executar todos.",
     )
+    parser.add_argument(
+        "--exclude-request-ids",
+        default="",
+        help="Lista separada por virgulas de request_ids que devem ser ignorados.",
+    )
     parser.add_argument("--print-chunk-matrix", action="store_true")
     return parser.parse_args()
 
@@ -650,6 +682,7 @@ def main() -> None:
         return
 
     jobs = filter_jobs_by_request_id(jobs, args.request_id)
+    jobs = exclude_jobs_by_request_ids(jobs, parse_request_id_list(args.exclude_request_ids))
     selected_jobs = chunk_jobs(jobs, args.chunk_index, args.chunk_size)
     if not selected_jobs:
         logger.info("Bloco %s sem jobs; nada a executar.", args.chunk_index)
