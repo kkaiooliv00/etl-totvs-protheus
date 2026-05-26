@@ -518,8 +518,10 @@ def chunk_jobs(jobs: list[EtlJob], chunk_index: int, chunk_size: int) -> list[Et
 
 
 def filter_jobs_by_request_id(jobs: list[EtlJob], request_id: int | None) -> list[EtlJob]:
-    if request_id is None:
+    if request_id is None or request_id == 0:
         return jobs
+    if request_id < 0:
+        raise RuntimeError("request_id nao pode ser negativo. Use 0 para executar todos.")
 
     selected_jobs = [job for job in jobs if job.request_id == request_id]
     if not selected_jobs:
@@ -632,8 +634,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-id",
         type=int,
-        default=None,
-        help="Executa apenas o job com este request_id. Se omitido, executa todos.",
+        default=0,
+        help="Executa apenas o job com este request_id. Use 0 para executar todos.",
     )
     parser.add_argument("--print-chunk-matrix", action="store_true")
     return parser.parse_args()
