@@ -57,4 +57,4 @@ jobs:
   - request_id: 42
     target_table: SF4
   - request_id: 43
-    target_table: STF
+    target_table: STL
