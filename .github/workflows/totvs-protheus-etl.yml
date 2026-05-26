@@ -24,7 +24,7 @@ permissions:
 
 concurrency:
   group: etl-totvs-protheus
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-etl:
