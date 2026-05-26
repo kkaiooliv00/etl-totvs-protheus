@@ -517,6 +517,22 @@ def chunk_jobs(jobs: list[EtlJob], chunk_index: int, chunk_size: int) -> list[Et
     return jobs[start : start + chunk_size]
 
 
+def filter_jobs_by_request_id(jobs: list[EtlJob], request_id: int | None) -> list[EtlJob]:
+    if request_id is None or request_id == 0:
+        return jobs
+    if request_id < 0:
+        raise RuntimeError("request_id nao pode ser negativo. Use 0 para executar todos.")
+
+    selected_jobs = [job for job in jobs if job.request_id == request_id]
+    if not selected_jobs:
+        available_ids = ", ".join(str(job.request_id) for job in jobs)
+        raise RuntimeError(
+            f"Nenhum job encontrado para request_id={request_id}. "
+            f"IDs disponiveis: {available_ids}"
+        )
+    return selected_jobs
+
+
 def chunk_matrix(jobs: list[EtlJob], chunk_size: int) -> str:
     chunk_count = (len(jobs) + chunk_size - 1) // chunk_size
     return json.dumps({"chunk_index": list(range(chunk_count))}, separators=(",", ":"))
@@ -615,6 +631,12 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Dias para filtro incremental. Use 0 para carga total sem filtro de data.",
     )
+    parser.add_argument(
+        "--request-id",
+        type=int,
+        default=0,
+        help="Executa apenas o job com este request_id. Use 0 para executar todos.",
+    )
     parser.add_argument("--print-chunk-matrix", action="store_true")
     return parser.parse_args()
 
@@ -627,6 +649,7 @@ def main() -> None:
         print(chunk_matrix(jobs, args.chunk_size))
         return
 
+    jobs = filter_jobs_by_request_id(jobs, args.request_id)
     selected_jobs = chunk_jobs(jobs, args.chunk_index, args.chunk_size)
     if not selected_jobs:
         logger.info("Bloco %s sem jobs; nada a executar.", args.chunk_index)

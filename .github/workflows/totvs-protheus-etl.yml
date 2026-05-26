@@ -8,6 +8,11 @@ on:
         required: true
         type: string
         default: "0"
+      request_id:
+        description: ID da API para executar apenas uma tabela. Use 0 para rodar todas.
+        required: true
+        type: string
+        default: "0"
   schedule:
     # GitHub cron uses UTC. Runs at 13:00 America/Fortaleza with 30 days of history.
     - cron: "0 16 * * *"
@@ -45,10 +50,13 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LOOKBACK_DAYS="${{ inputs.lookback_days }}"
+            REQUEST_ID="${{ inputs.request_id }}"
           elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
             LOOKBACK_DAYS="60"
+            REQUEST_ID="0"
           else
             LOOKBACK_DAYS="30"
+            REQUEST_ID="0"
           fi
 
-          python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS"
+          python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS" --request-id "$REQUEST_ID"
