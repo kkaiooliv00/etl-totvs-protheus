@@ -41,5 +41,13 @@ jobs:
         env:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || github.event.schedule == '0 5 * * *' && '60' || '30' }}
-        run: python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            LOOKBACK_DAYS="${{ inputs.lookback_days }}"
+          elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
+            LOOKBACK_DAYS="60"
+          else
+            LOOKBACK_DAYS="30"
+          fi
+
+          python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS"
