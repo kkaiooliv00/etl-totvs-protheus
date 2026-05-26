@@ -6,6 +6,7 @@ on:
       lookback_days:
         description: Dias para atualizar os jobs com filtro de data. Use 0 para carga total.
         required: true
+        type: string
         default: "0"
   schedule:
     # GitHub cron uses UTC. Runs at 13:00 America/Fortaleza with 30 days of history.
