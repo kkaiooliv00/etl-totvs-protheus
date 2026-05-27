@@ -23,6 +23,7 @@ from requests.adapters import HTTPAdapter
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import NullPool
 from urllib3.util.retry import Retry
 
 
@@ -688,7 +689,7 @@ def main() -> None:
         logger.info("Bloco %s sem jobs; nada a executar.", args.chunk_index)
         return
 
-    engine = create_engine(require_postgres_database_url(), pool_pre_ping=True)
+    engine = create_engine(require_postgres_database_url(), poolclass=NullPool)
     failed_jobs: list[str] = []
     succeeded_jobs: list[str] = []
     try:
