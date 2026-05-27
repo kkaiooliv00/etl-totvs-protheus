@@ -236,36 +236,54 @@ def iter_api_pages(job: EtlJob, lookback_days: int | None):
                 "data": request_data(job, page, lookback_days),
             }
 
-            try:
-                response = session.post(
-                    API_URL,
-                    json=body,
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-                if response.status_code >= 400:
-                    logger.error(
-                        "%s | API retornou HTTP %s na pagina %s. Resposta: %s",
-                        job.target_table,
-                        response.status_code,
-                        page,
-                        response.text[:1000],
+            for attempt in range(1, REQUEST_RETRY_COUNT + 2):
+                response: requests.Response | None = None
+                try:
+                    response = session.post(
+                        API_URL,
+                        json=body,
+                        timeout=REQUEST_TIMEOUT_SECONDS,
                     )
-                response.raise_for_status()
-                page_items = extract_items(response.json())
-            except requests.RequestException:
-                logger.exception(
-                    "Falha ao extrair pagina %s do request_id %s.",
-                    page,
-                    job.request_id,
-                )
-                raise
-            except ValueError:
-                logger.exception(
-                    "Resposta invalida na pagina %s do request_id %s.",
-                    page,
-                    job.request_id,
-                )
-                raise
+                    if response.status_code >= 400:
+                        logger.error(
+                            "%s | API retornou HTTP %s na pagina %s. Resposta: %s",
+                            job.target_table,
+                            response.status_code,
+                            page,
+                            response.text[:1000],
+                        )
+                    response.raise_for_status()
+                    page_items = extract_items(response.json())
+                    break
+                except requests.RequestException:
+                    if attempt <= REQUEST_RETRY_COUNT:
+                        response_text = response.text[:500] if response is not None else ""
+                        wait_seconds = 2 * attempt
+                        logger.warning(
+                            "%s | Falha transiente na pagina %s, tentativa %s/%s. "
+                            "Aguardando %ss. Resposta: %s",
+                            job.target_table,
+                            page,
+                            attempt,
+                            REQUEST_RETRY_COUNT + 1,
+                            wait_seconds,
+                            response_text,
+                        )
+                        time.sleep(wait_seconds)
+                        continue
+                    logger.exception(
+                        "Falha ao extrair pagina %s do request_id %s.",
+                        page,
+                        job.request_id,
+                    )
+                    raise
+                except ValueError:
+                    logger.exception(
+                        "Resposta invalida na pagina %s do request_id %s.",
+                        page,
+                        job.request_id,
+                    )
+                    raise
 
             if page == START_PAGE or page % PAGE_LOG_INTERVAL == 0 or len(page_items) < PAGE_SIZE:
                 logger.info(
