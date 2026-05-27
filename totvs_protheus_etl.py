@@ -690,7 +690,7 @@ def main() -> None:
         return
 
     engine = create_engine(require_postgres_database_url(), poolclass=NullPool)
-    failed_jobs: list[str] = []
+    failed_jobs: dict[str, str] = {}
     succeeded_jobs: list[str] = []
     try:
         preflight_database_connection(engine)
@@ -699,13 +699,13 @@ def main() -> None:
             try:
                 run_job(engine, job, lookback_days)
                 succeeded_jobs.append(job.target_table)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Job request_id=%s target_table=%s falhou.",
                     job.request_id,
                     job.target_table,
                 )
-                failed_jobs.append(job.target_table)
+                failed_jobs[job.target_table] = f"{type(exc).__name__}: {exc}"
 
         logger.info(
             "Resumo da execucao: %s jobs com sucesso, %s jobs com falha.",
@@ -714,6 +714,8 @@ def main() -> None:
         )
         if failed_jobs:
             logger.error("Jobs com falha: %s", ", ".join(failed_jobs))
+            for target_table, error_message in failed_jobs.items():
+                logger.error("%s | Erro resumido: %s", target_table, error_message)
 
         if failed_jobs:
             raise RuntimeError(f"Jobs com falha no bloco: {', '.join(failed_jobs)}")
