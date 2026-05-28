@@ -1,38 +1,23 @@
 name: ETL TOTVS Protheus
 
-# ──────────────────────────────────────────────────────────────────────────────
-# OTIMIZAÇÕES APLICADAS
-#
-# [Cache de dependências]
-#   • python-version fixado em patch version → cache hit máximo entre runs.
-#   • cache-dependency-path: requirements.txt → layer de pip só é invalidado
-#     quando o arquivo mudar. Step "Instalar dependências" vira no-op na maioria
-#     das execuções (~2 min economizados por runner).
-#
-# [Cron — somente dias úteis]
-#   • Execução removida de sábado e domingo.
-#   • Todas as tabelas rodam seg–sex (conforme solicitado).
-#   • lookback_days reduzido de 30 → 7 dias para execuções automáticas.
-# ──────────────────────────────────────────────────────────────────────────────
-
 on:
   workflow_dispatch:
     inputs:
       lookback_days:
         description: >
-          Dias de histórico a sincronizar. Use 0 para carga total sem filtro de data.
+          Dias de historico a sincronizar. Use 0 para carga total sem filtro de data.
         required: true
         type: string
         default: "7"
       request_id:
         description: >
-          request_id de uma tabela específica. Use 0 para rodar todas.
+          request_id de uma tabela especifica. Use 0 para rodar todas.
         required: true
         type: string
         default: "0"
 
   schedule:
-    # Seg–Sex, 13h Fortaleza (16h UTC). Não roda sábado (6) nem domingo (0/7).
+    # Seg-Sex, 13h Fortaleza (16h UTC). Nao roda sabado nem domingo.
     - cron: "0 16 * * 1-5"
 
 permissions:
@@ -43,229 +28,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 1 — ETL Geral (todas as tabelas exceto DBM, SC1, STL, SE2)
-  # ────────────────────────────────────────────────────────────────────────────
-  run-etl-general:
-    name: ETL Geral
+  run-etl:
+    name: ETL TOTVS Protheus
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.request_id == '0' ||
-      (
-        inputs.request_id != '17' &&
-        inputs.request_id != '28' &&
-        inputs.request_id != '44' &&
-        inputs.request_id != '45'
-      )
+    timeout-minutes: 300
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python com cache de dependências
+      - name: Setup Python com cache de dependencias
         uses: actions/setup-python@v5
         with:
           python-version: "3.12.9"
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Instalar dependências
+      - name: Instalar dependencias
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Resolver parâmetros de execução
+      - name: Resolver lookback_days
         id: params
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            LOOKBACK="${{ inputs.lookback_days }}"
+            echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
           else
-            LOOKBACK="7"
+            echo "lookback_days=7" >> "$GITHUB_OUTPUT"
           fi
-          echo "lookback_days=$LOOKBACK" >> "$GITHUB_OUTPUT"
 
-      - name: Executar ETL Geral
+      - name: Executar ETL
         env:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          if [ "${{ inputs.request_id }}" != "0" ] && [ -n "${{ inputs.request_id }}" ]; then
+          if [ -n "${{ inputs.request_id }}" ] && [ "${{ inputs.request_id }}" != "0" ]; then
             python totvs_protheus_etl.py \
               --lookback-days "${{ steps.params.outputs.lookback_days }}" \
               --request-id "${{ inputs.request_id }}"
           else
             python totvs_protheus_etl.py \
-              --lookback-days "${{ steps.params.outputs.lookback_days }}" \
-              --exclude-request-ids "17,28,44,45"
+              --lookback-days "${{ steps.params.outputs.lookback_days }}"
           fi
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 2 — DBM (request_id=28)
-  # ────────────────────────────────────────────────────────────────────────────
-  run-etl-dbm:
-    name: ETL DBM
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.request_id == '0' ||
-      inputs.request_id == '28'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python com cache de dependências
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12.9"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Instalar dependências
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
-
-      - name: Resolver lookback_days
-        id: params
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "lookback_days=7" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Executar ETL DBM
-        env:
-          API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python totvs_protheus_etl.py \
-            --lookback-days "${{ steps.params.outputs.lookback_days }}" \
-            --request-id 28
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 3 — SC1 (request_id=17)
-  # ────────────────────────────────────────────────────────────────────────────
-  run-etl-sc1:
-    name: ETL SC1
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.request_id == '0' ||
-      inputs.request_id == '17'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python com cache de dependências
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12.9"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Instalar dependências
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
-
-      - name: Resolver lookback_days
-        id: params
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "lookback_days=7" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Executar ETL SC1
-        env:
-          API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python totvs_protheus_etl.py \
-            --lookback-days "${{ steps.params.outputs.lookback_days }}" \
-            --request-id 17
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 4 — STL (request_id=44)
-  # ────────────────────────────────────────────────────────────────────────────
-  run-etl-stl:
-    name: ETL STL
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.request_id == '0' ||
-      inputs.request_id == '44'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python com cache de dependências
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12.9"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Instalar dependências
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
-
-      - name: Resolver lookback_days
-        id: params
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "lookback_days=7" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Executar ETL STL
-        env:
-          API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python totvs_protheus_etl.py \
-            --lookback-days "${{ steps.params.outputs.lookback_days }}" \
-            --request-id 44
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 5 — SE2 (request_id=45)
-  # ────────────────────────────────────────────────────────────────────────────
-  run-etl-se2:
-    name: ETL SE2
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.request_id == '0' ||
-      inputs.request_id == '45'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python com cache de dependências
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12.9"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Instalar dependências
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
-
-      - name: Resolver lookback_days
-        id: params
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "lookback_days=7" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Executar ETL SE2
-        env:
-          API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python totvs_protheus_etl.py \
-            --lookback-days "${{ steps.params.outputs.lookback_days }}" \
-            --request-id 45

@@ -1,35 +1,35 @@
 """ETL incremental de requisicoes HyperSync TOTVS para PostgreSQL.
 
-Otimizacoes em relacao a versao anterior:
-- Extracao da API com aiohttp + asyncio (requisicoes concorrentes por job)
-- Escrita no staging via COPY binario (psycopg3 copy_records_to_table)
-  em vez de INSERT em chunks pelo SQLAlchemy/pandas.to_sql
-- Upsert final executado em uma unica instrucao SQL sem paginacao por OFFSET
-  (elimina varreduras repetidas na staging table)
-- Pool de conexoes reutilizado no engine (remove overhead de connect/disconnect)
-- Buffer de DataFrames concatenado so uma vez por flush, sem .copy() desnecessario
-- Conversao de tipos feita uma unica vez antes do COPY
+Decisoes de arquitetura:
+- Extracao da API: requisicoes SEQUENCIAIS (uma pagina por vez via requests
+  sincrono). O servidor TOTVS Protheus derruba conexoes com qualquer nivel
+  de paralelismo (ServerDisconnectedError persistente mesmo com 3 workers).
+  Throughput aceitavel pois o gargalo e o banco, nao a API.
+- Escrita no staging: COPY via psycopg3 — ordens de magnitude mais rapido
+  que INSERT/pandas.to_sql para volumes altos.
+- Upsert final: uma unica instrucao SQL (sem loop de OFFSET).
+- Pool de conexoes reutilizado (QueuePool) — sem handshake SSL repetido.
+- Encoding: respostas lidas como bytes e decodificadas com fallback
+  utf-8 -> latin-1 -> windows-1252 (API TOTVS retorna latin-1 em alguns campos).
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from io import StringIO
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, Iterator
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-import aiohttp
 import pandas as pd
 import psycopg
+import requests
 import yaml
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
@@ -51,27 +51,19 @@ JOB_CONFIG_PATH = Path(os.getenv("ETL_JOBS_FILE", "etl_jobs.yml"))
 START_PAGE = 1
 PAGE_SIZE = 100
 
-# ── Tuning ──────────────────────────────────────────────────────────────
-# Numero de paginas da API buscadas em paralelo por job (aiohttp).
-# Aumentar aqui reduz o tempo de extracao, mas pressiona o rate-limit da API.
-API_CONCURRENT_PAGES = 8
-
-# Registros acumulados no buffer antes de despejar no staging via COPY.
-# Valores maiores = menos round-trips; valores menores = menor uso de RAM.
-STAGING_FLUSH_RECORDS = 10_000
-
-# Tamanho do lote para upsert final (nao usa mais OFFSET; e apenas para log).
-UPSERT_LOG_INTERVAL = 10_000
-
+# ── Tuning ───────────────────────────────────────────────────────────────────
+# Requisicoes sequenciais — sem paralelismo (servidor TOTVS nao suporta).
 REQUEST_TIMEOUT_SECONDS = 60
 REQUEST_RETRY_COUNT = 3
-DATABASE_WRITE_RETRY_COUNT = 3
+
+# Registros acumulados antes de despejar no staging via COPY.
+STAGING_FLUSH_RECORDS = 10_000
+
 PAGE_LOG_INTERVAL = 10
 BUSINESS_TIMEZONE = ZoneInfo("America/Fortaleza")
-
 TARGET_SCHEMA = "totvs"
 BUSINESS_KEY = "super_chave"
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +71,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("totvs_protheus_etl")
 
+
+# ── Modelos ───────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class EtlJob:
@@ -97,7 +91,7 @@ class EtlJob:
         return f"{self.target_table}_staging_dedup"
 
 
-# ── Utilitarios ──────────────────────────────────────────────────────────
+# ── Utilitarios ───────────────────────────────────────────────────────────────
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
@@ -108,8 +102,7 @@ def require_env(name: str) -> str:
 
 def require_postgres_database_url() -> str:
     database_url = require_env(DATABASE_URL_ENV)
-    parsed_url = urlparse(database_url)
-    scheme = parsed_url.scheme
+    scheme = urlparse(database_url).scheme
     if scheme not in ("postgresql", "postgresql+psycopg", "postgres"):
         raise RuntimeError(
             "DATABASE_URL invalida. Use uma URL PostgreSQL como "
@@ -119,15 +112,16 @@ def require_postgres_database_url() -> str:
 
 
 def _normalize_dsn(database_url: str) -> str:
-    """Converte URL SQLAlchemy para DSN nativo do psycopg3."""
-    return database_url.replace("postgresql+psycopg://", "postgresql://").replace(
-        "postgresql+psycopg2://", "postgresql://"
+    return (
+        database_url
+        .replace("postgresql+psycopg://", "postgresql://")
+        .replace("postgresql+psycopg2://", "postgresql://")
     )
 
 
 def preflight_database_connection(engine: Engine) -> None:
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
 
 
 def quote_identifier(identifier: str) -> str:
@@ -138,31 +132,31 @@ def qualified_table(schema: str, table: str) -> str:
     return f"{quote_identifier(schema)}.{quote_identifier(table)}"
 
 
-# ── Carregamento de jobs ─────────────────────────────────────────────────
+# ── Carregamento de jobs ──────────────────────────────────────────────────────
 
 def load_jobs() -> list[EtlJob]:
     if not JOB_CONFIG_PATH.exists():
         raise RuntimeError(f"Arquivo de jobs nao encontrado: {JOB_CONFIG_PATH}")
 
-    with JOB_CONFIG_PATH.open(encoding="utf-8") as config_file:
-        config = yaml.safe_load(config_file) or {}
+    with JOB_CONFIG_PATH.open(encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
 
     raw_jobs = config.get("jobs")
     if not isinstance(raw_jobs, list) or not raw_jobs:
         raise RuntimeError("etl_jobs.yml deve conter uma lista nao vazia em jobs.")
 
     jobs: list[EtlJob] = []
-    for raw_job in raw_jobs:
-        if not isinstance(raw_job, dict):
+    for raw in raw_jobs:
+        if not isinstance(raw, dict):
             raise RuntimeError("Cada job deve conter request_id e target_table.")
         try:
-            request_id = int(raw_job["request_id"])
-            target_table = str(raw_job["target_table"]).strip()
-            date_parameter = raw_job.get("date_parameter")
-            business_key = str(raw_job.get("business_key", BUSINESS_KEY)).strip()
-            raw_bk_cols = raw_job.get("business_key_columns") or []
+            request_id = int(raw["request_id"])
+            target_table = str(raw["target_table"]).strip()
+            date_parameter = raw.get("date_parameter")
+            business_key = str(raw.get("business_key", BUSINESS_KEY)).strip()
+            raw_bk_cols = raw.get("business_key_columns") or []
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"Job invalido em {JOB_CONFIG_PATH}: {raw_job!r}") from exc
+            raise RuntimeError(f"Job invalido em {JOB_CONFIG_PATH}: {raw!r}") from exc
 
         if not target_table:
             raise RuntimeError("target_table nao pode ser vazio.")
@@ -173,19 +167,17 @@ def load_jobs() -> list[EtlJob]:
         business_key_columns = tuple(
             str(c).strip() for c in raw_bk_cols if str(c).strip()
         )
-        jobs.append(
-            EtlJob(
-                request_id=request_id,
-                target_table=target_table,
-                date_parameter=date_parameter,
-                business_key=business_key,
-                business_key_columns=business_key_columns,
-            )
-        )
+        jobs.append(EtlJob(
+            request_id=request_id,
+            target_table=target_table,
+            date_parameter=date_parameter,
+            business_key=business_key,
+            business_key_columns=business_key_columns,
+        ))
     return jobs
 
 
-# ── Extracao assincrona da API ───────────────────────────────────────────
+# ── Extracao sincrona da API ──────────────────────────────────────────────────
 
 def format_start_date(lookback_days: int) -> str:
     current_date = datetime.now(BUSINESS_TIMEZONE).date()
@@ -199,11 +191,24 @@ def _build_body(job: EtlJob, page: int, lookback_days: int | None) -> dict[str, 
     return {"id": job.request_id, "data": data}
 
 
+def _decode_response(raw_bytes: bytes) -> str:
+    """Decodifica bytes com fallback: utf-8 -> latin-1 -> windows-1252.
+    A API TOTVS Protheus retorna latin-1 em alguns endpoints sem declara-lo
+    no Content-Type, causando UnicodeDecodeError quando assume-se UTF-8.
+    """
+    for encoding in ("utf-8", "latin-1", "windows-1252"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("latin-1", errors="replace")
+
+
 def extract_items(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return payload
     if not isinstance(payload, dict):
-        raise ValueError("A API retornou um JSON fora do formato esperado.")
+        return []
     for key in ("items", "results", "records", "rows", "result"):
         value = payload.get(key)
         if isinstance(value, list):
@@ -214,140 +219,146 @@ def extract_items(payload: Any) -> list[dict[str, Any]]:
     list_values = [v for v in payload.values() if isinstance(v, list)]
     if len(list_values) == 1:
         return extract_items(list_values[0])
-    if not payload:
-        return []
-    raise ValueError("Nao foi possivel localizar os registros no JSON da API.")
+    # Payload sem lista reconhecivel = fim de dados ou resposta de erro
+    logger.debug("extract_items: nenhuma lista encontrada no payload: %s", str(payload)[:300])
+    return []
 
 
-async def _fetch_page(
-    session: aiohttp.ClientSession,
+def _fetch_page_sync(
+    session: requests.Session,
     job: EtlJob,
     page: int,
     lookback_days: int | None,
-    semaphore: asyncio.Semaphore,
-) -> tuple[int, list[dict[str, Any]]]:
-    """Busca uma unica pagina; retorna (page, items)."""
-    async with semaphore:
-        body = _build_body(job, page, lookback_days)
-        for attempt in range(1, REQUEST_RETRY_COUNT + 2):
+) -> list[dict[str, Any]]:
+    """Busca uma unica pagina de forma sincrona com retry exponencial."""
+    body = _build_body(job, page, lookback_days)
+
+    for attempt in range(1, REQUEST_RETRY_COUNT + 2):
+        try:
+            response = session.post(
+                API_URL,
+                json=body,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "%s | HTTP %s na pagina %s: %s",
+                    job.target_table, response.status_code, page,
+                    response.text[:500],
+                )
+            response.raise_for_status()
+
+            text_body = _decode_response(response.content)
+            stripped = text_body.strip()
+
+            # Corpo vazio ou JSON nulo = fim de paginacao
+            if not stripped or stripped in ("{}", "[]", "null"):
+                logger.info(
+                    "%s | Pagina %s retornou corpo vazio; fim de paginacao.",
+                    job.target_table, page,
+                )
+                return []
+
             try:
-                async with session.post(
-                    API_URL,
-                    json=body,
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
-                ) as response:
-                    if response.status >= 400:
-                        text_body = await response.text()
-                        logger.error(
-                            "%s | HTTP %s na pagina %s: %s",
-                            job.target_table, response.status, page, text_body[:500],
-                        )
-                    response.raise_for_status()
-                    payload = await response.json(content_type=None)
-                    return page, extract_items(payload)
-            except (aiohttp.ClientError, ValueError):
-                if attempt <= REQUEST_RETRY_COUNT:
-                    wait = 2 * attempt
-                    logger.warning(
-                        "%s | Falha pagina %s tentativa %s/%s; aguardando %ss.",
-                        job.target_table, page, attempt, REQUEST_RETRY_COUNT + 1, wait,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                logger.exception("Falha definitiva pagina %s request_id %s.", page, job.request_id)
-                raise
-    # nunca atingido; satisfaz o type checker
-    return page, []
+                payload = json.loads(text_body)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Resposta nao e JSON valido na pagina {page}: {text_body[:200]}"
+                ) from exc
+
+            return extract_items(payload)
+
+        except (requests.RequestException, ValueError) as exc:
+            if attempt <= REQUEST_RETRY_COUNT:
+                wait = 2 * attempt
+                logger.warning(
+                    "%s | Falha pagina %s tentativa %s/%s; aguardando %ss. Erro: %s",
+                    job.target_table, page, attempt, REQUEST_RETRY_COUNT + 1,
+                    wait, exc,
+                )
+                time.sleep(wait)
+                continue
+            logger.exception(
+                "Falha definitiva pagina %s request_id %s.", page, job.request_id
+            )
+            raise
+
+    return []  # nunca atingido
 
 
-async def iter_api_pages_async(
+def iter_api_pages(
     job: EtlJob,
     lookback_days: int | None,
-) -> AsyncIterator[tuple[int, list[dict[str, Any]]]]:
-    """Pagina a API com janela de requisicoes paralelas.
+) -> Iterator[tuple[int, list[dict[str, Any]]]]:
+    """Pagina a API sequencialmente, uma pagina por vez."""
+    password = require_env(API_PASSWORD_ENV)
+    session = requests.Session()
+    session.auth = (API_USER, password)
+    session.headers.update({"Content-Type": "application/json"})
 
-    Estrategia:
-    1. Dispara API_CONCURRENT_PAGES requisicoes em paralelo.
-    2. Processa os resultados em ordem crescente de pagina.
-    3. Se a ultima pagina retornar menos que PAGE_SIZE itens, para.
-    """
-    semaphore = asyncio.Semaphore(API_CONCURRENT_PAGES)
-    auth = aiohttp.BasicAuth(API_USER, require_env(API_PASSWORD_ENV))
-    headers = {"Content-Type": "application/json"}
+    try:
+        for page in range(START_PAGE, 99_999):
+            items = _fetch_page_sync(session, job, page, lookback_days)
 
-    async with aiohttp.ClientSession(auth=auth, headers=headers) as session:
-        page = START_PAGE
-        finished = False
+            if page == START_PAGE or page % PAGE_LOG_INTERVAL == 0:
+                logger.info(
+                    "%s | Pagina %s extraida com %s registros.",
+                    job.target_table, page, len(items),
+                )
 
-        while not finished:
-            # Prepara um lote de paginas a buscar
-            batch_pages = list(range(page, page + API_CONCURRENT_PAGES))
-            tasks = [
-                asyncio.create_task(_fetch_page(session, job, p, lookback_days, semaphore))
-                for p in batch_pages
-            ]
-            results = await asyncio.gather(*tasks)
+            yield page, items
 
-            for fetched_page, items in sorted(results, key=lambda x: x[0]):
-                if fetched_page == START_PAGE or fetched_page % PAGE_LOG_INTERVAL == 0:
-                    logger.info(
-                        "%s | Pagina %s extraida com %s registros.",
-                        job.target_table, fetched_page, len(items),
-                    )
-                yield fetched_page, items
-                if not items or len(items) < PAGE_SIZE:
-                    logger.info(
-                        "%s | Paginacao encerrada na pagina %s.", job.target_table, fetched_page
-                    )
-                    finished = True
-                    break
-
-            page += API_CONCURRENT_PAGES
+            if not items or len(items) < PAGE_SIZE:
+                logger.info(
+                    "%s | Paginacao encerrada na pagina %s.", job.target_table, page
+                )
+                break
+    finally:
+        session.close()
 
 
-# ── Transformacao ────────────────────────────────────────────────────────
+# ── Transformacao ─────────────────────────────────────────────────────────────
 
 def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFrame:
-    dataframe = pd.json_normalize(records, sep="_")
-    if dataframe.empty:
-        return dataframe
+    df = pd.json_normalize(records, sep="_")
+    if df.empty:
+        return df
 
-    if job.business_key not in dataframe.columns and job.business_key_columns:
-        missing = [c for c in job.business_key_columns if c not in dataframe.columns]
+    if job.business_key not in df.columns and job.business_key_columns:
+        missing = [c for c in job.business_key_columns if c not in df.columns]
         if missing:
             raise KeyError(
                 f"Colunas para chave composta ausentes em {job.target_table}: "
                 f"{', '.join(missing)}"
             )
-        dataframe[job.business_key] = (
-            dataframe.loc[:, list(job.business_key_columns)]
+        df[job.business_key] = (
+            df.loc[:, list(job.business_key_columns)]
             .fillna("")
             .astype(str)
             .agg("|".join, axis=1)
         )
 
-    if job.business_key not in dataframe.columns:
-        received = ", ".join(str(c) for c in dataframe.columns)
+    if job.business_key not in df.columns:
+        received = ", ".join(str(c) for c in df.columns)
         raise KeyError(
             f"Coluna obrigatoria ausente: {job.business_key}. "
             f"Colunas recebidas em {job.target_table}: {received}"
         )
 
-    return dataframe.drop_duplicates(subset=[job.business_key], keep="last")
+    return df.drop_duplicates(subset=[job.business_key], keep="last")
 
 
-# ── Escrita no staging via COPY (psycopg3) ───────────────────────────────
+# ── Escrita no staging via COPY (psycopg3) ────────────────────────────────────
 
 def _prepare_dataframe_for_copy(df: pd.DataFrame) -> pd.DataFrame:
-    """Converte colunas object/dict/list para string JSON de forma vetorizada."""
     df = df.copy()
     for col in df.columns:
         if df[col].dtype == object:
-            # Detecta se ha celulas que sao dict ou list (nao-escalares)
             sample = df[col].dropna().head(10)
             if any(isinstance(v, (dict, list)) for v in sample):
                 df[col] = df[col].apply(
-                    lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
+                    lambda v: json.dumps(v, ensure_ascii=False)
+                    if isinstance(v, (dict, list)) else v
                 )
     return df
 
@@ -358,24 +369,18 @@ def _copy_dataframe_to_staging(
     df: pd.DataFrame,
     if_exists: str,
 ) -> None:
-    """Usa psycopg3 COPY para inserir o DataFrame no staging — ordens de magnitude
-    mais rapido que INSERT para volumes altos.
-
-    'if_exists' pode ser 'replace' (primeira chamada) ou 'append'.
-    """
     if df.empty:
         return
 
     df = _prepare_dataframe_for_copy(df)
     staging_fqn = qualified_table(TARGET_SCHEMA, job.staging_table)
     columns_sql = ", ".join(quote_identifier(c) for c in df.columns)
-    col_types = {c: str(df[c].dtype) for c in df.columns}
 
     with psycopg.connect(dsn) as conn:
         if if_exists == "replace":
-            # Recria a tabela de staging com os tipos corretos
             col_defs = []
-            for col, dtype in col_types.items():
+            for col in df.columns:
+                dtype = str(df[col].dtype)
                 if "int" in dtype:
                     pg_type = "BIGINT"
                 elif "float" in dtype:
@@ -389,11 +394,8 @@ def _copy_dataframe_to_staging(
                 col_defs.append(f"{quote_identifier(col)} {pg_type}")
 
             conn.execute(f"DROP TABLE IF EXISTS {staging_fqn}")
-            conn.execute(
-                f"CREATE TABLE {staging_fqn} ({', '.join(col_defs)})"
-            )
+            conn.execute(f"CREATE TABLE {staging_fqn} ({', '.join(col_defs)})")
 
-        # COPY com texto delimitado por tabulacao — evita overhead de parsing JSON
         copy_sql = (
             f"COPY {staging_fqn} ({columns_sql}) "
             f"FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')"
@@ -407,7 +409,6 @@ def _copy_dataframe_to_staging(
                         if val is None or (isinstance(val, float) and pd.isna(val)):
                             formatted.append("\\N")
                         else:
-                            # Escapa tabulacao e nova linha para o formato TEXT do COPY
                             formatted.append(
                                 str(val)
                                 .replace("\\", "\\\\")
@@ -425,10 +426,12 @@ def _copy_dataframe_to_staging(
     )
 
 
-# ── DDL e Upsert ─────────────────────────────────────────────────────────
+# ── DDL e Upsert ──────────────────────────────────────────────────────────────
 
 def create_schema(connection: Connection) -> None:
-    connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quote_identifier(TARGET_SCHEMA)}"))
+    connection.execute(
+        text(f"CREATE SCHEMA IF NOT EXISTS {quote_identifier(TARGET_SCHEMA)}")
+    )
 
 
 def drop_staging_tables(connection: Connection, job: EtlJob) -> None:
@@ -448,7 +451,9 @@ def create_target_from_staging(connection: Connection, job: EtlJob) -> None:
     )
 
 
-def add_missing_target_columns(connection: Connection, engine: Engine, job: EtlJob) -> None:
+def add_missing_target_columns(
+    connection: Connection, engine: Engine, job: EtlJob
+) -> None:
     inspector = inspect(connection)
     target_columns = {
         col["name"]
@@ -470,7 +475,6 @@ def add_missing_target_columns(connection: Connection, engine: Engine, job: EtlJ
 def ensure_unique_constraint(connection: Connection, job: EtlJob) -> None:
     target = qualified_table(TARGET_SCHEMA, job.target_table)
     constraint_name = f"{job.target_table}_{job.business_key}_uk"
-    constraint = quote_identifier(constraint_name)
     key = quote_identifier(job.business_key)
 
     exists = connection.execute(
@@ -490,19 +494,22 @@ def ensure_unique_constraint(connection: Connection, job: EtlJob) -> None:
 
     if not exists:
         connection.execute(
-            text(f"ALTER TABLE {target} ADD CONSTRAINT {constraint} UNIQUE ({key})")
+            text(
+                f"ALTER TABLE {target} ADD CONSTRAINT "
+                f"{quote_identifier(constraint_name)} UNIQUE ({key})"
+            )
         )
 
 
-def create_dedup_staging(connection: Connection, job: EtlJob, columns: list[str]) -> None:
+def create_dedup_staging(
+    connection: Connection, job: EtlJob, columns: list[str]
+) -> None:
     quoted_cols = ", ".join(quote_identifier(c) for c in columns)
     source = qualified_table(TARGET_SCHEMA, job.staging_table)
     dedup = qualified_table(TARGET_SCHEMA, job.dedup_staging_table)
     key = quote_identifier(job.business_key)
 
-    connection.execute(
-        text(f"DROP TABLE IF EXISTS {dedup}")
-    )
+    connection.execute(text(f"DROP TABLE IF EXISTS {dedup}"))
     connection.execute(
         text(
             f"""
@@ -510,7 +517,9 @@ def create_dedup_staging(connection: Connection, job: EtlJob, columns: list[str]
             SELECT {quoted_cols}
             FROM (
                 SELECT {quoted_cols},
-                       ROW_NUMBER() OVER (PARTITION BY {key} ORDER BY ctid DESC) AS __rn
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {key} ORDER BY ctid DESC
+                       ) AS __rn
                 FROM {source}
             ) s
             WHERE __rn = 1
@@ -519,13 +528,9 @@ def create_dedup_staging(connection: Connection, job: EtlJob, columns: list[str]
     )
 
 
-def upsert_from_staging(connection: Connection, job: EtlJob, columns: list[str]) -> None:
-    """Upsert em UMA unica instrucao SQL — sem loop de OFFSET.
-
-    A versao anterior paginava por OFFSET dentro do loop Python, o que
-    forçava o PostgreSQL a varrer a tabela de staging N vezes. Aqui
-    delegamos toda a operacao ao Postgres em um unico round-trip.
-    """
+def upsert_from_staging(
+    connection: Connection, job: EtlJob, columns: list[str]
+) -> None:
     quoted_cols = ", ".join(quote_identifier(c) for c in columns)
     update_cols = [c for c in columns if c != job.business_key]
     key = quote_identifier(job.business_key)
@@ -541,17 +546,18 @@ def upsert_from_staging(connection: Connection, job: EtlJob, columns: list[str])
     else:
         conflict_action = "DO NOTHING"
 
-    upsert_sql = f"""
-        INSERT INTO {target} ({quoted_cols})
-        SELECT {quoted_cols}
-        FROM {dedup}
-        ON CONFLICT ({key}) {conflict_action}
-    """
-    result = connection.execute(text(upsert_sql))
+    result = connection.execute(
+        text(
+            f"""
+            INSERT INTO {target} ({quoted_cols})
+            SELECT {quoted_cols} FROM {dedup}
+            ON CONFLICT ({key}) {conflict_action}
+            """
+        )
+    )
     logger.info(
         "%s | UPSERT concluido: %s linhas afetadas.",
-        job.target_table,
-        result.rowcount,
+        job.target_table, result.rowcount,
     )
 
 
@@ -565,11 +571,14 @@ def finalize_load(engine: Engine, job: EtlJob, columns: list[str]) -> None:
         drop_staging_tables(conn, job)
 
 
-# ── Orquestrador por job ─────────────────────────────────────────────────
+# ── Orquestrador por job ──────────────────────────────────────────────────────
 
 def run_job(engine: Engine, job: EtlJob, lookback_days: int | None) -> None:
     started_at = time.perf_counter()
-    logger.info("Iniciando job request_id=%s target_table=%s.", job.request_id, job.target_table)
+    logger.info(
+        "Iniciando job request_id=%s target_table=%s.",
+        job.request_id, job.target_table,
+    )
 
     dsn = _normalize_dsn(require_env(DATABASE_URL_ENV))
     extracted_records = 0
@@ -579,11 +588,12 @@ def run_job(engine: Engine, job: EtlJob, lookback_days: int | None) -> None:
     buffer_frames: list[pd.DataFrame] = []
     buffer_records = 0
 
-    async def _run() -> None:
-        nonlocal extracted_records, staged_records, columns, staging_mode
-        nonlocal buffer_frames, buffer_records
+    with engine.begin() as conn:
+        create_schema(conn)
+        drop_staging_tables(conn, job)
 
-        async for page, records in iter_api_pages_async(job, lookback_days):
+    try:
+        for page, records in iter_api_pages(job, lookback_days):
             extracted_records += len(records)
             if not records:
                 continue
@@ -612,29 +622,23 @@ def run_job(engine: Engine, job: EtlJob, lookback_days: int | None) -> None:
                     job.target_table, page, extracted_records, staged_records,
                 )
 
-    try:
-        with engine.begin() as conn:
-            create_schema(conn)
-            drop_staging_tables(conn, job)
-
-        asyncio.run(_run())
-
-        if columns is None:
-            logger.info("%s | Nenhum registro retornado; carga dispensada.", job.target_table)
-            return
-
-        # Flush do buffer residual
-        if buffer_frames:
-            merged = pd.concat(buffer_frames, ignore_index=True)
-            _copy_dataframe_to_staging(dsn, job, merged, staging_mode)
-            staged_records += len(merged)
-            buffer_frames.clear()
-
-        finalize_load(engine, job, columns)
-
     except SQLAlchemyError:
         logger.exception("%s | Falha durante a carga no PostgreSQL.", job.target_table)
         raise
+
+    if columns is None:
+        logger.info(
+            "%s | Nenhum registro retornado; carga dispensada.", job.target_table
+        )
+        return
+
+    # Flush do buffer residual
+    if buffer_frames:
+        merged = pd.concat(buffer_frames, ignore_index=True)
+        _copy_dataframe_to_staging(dsn, job, merged, staging_mode)
+        staged_records += len(merged)
+
+    finalize_load(engine, job, columns)
 
     elapsed = time.perf_counter() - started_at
     logger.info(
@@ -644,19 +648,20 @@ def run_job(engine: Engine, job: EtlJob, lookback_days: int | None) -> None:
     )
 
 
-# ── CLI e entrypoint ──────────────────────────────────────────────────────
+# ── CLI e entrypoint ──────────────────────────────────────────────────────────
 
 def chunk_jobs(jobs: list[EtlJob], chunk_index: int, chunk_size: int) -> list[EtlJob]:
     if chunk_index < 0:
         raise RuntimeError("chunk_index nao pode ser negativo.")
     if chunk_size <= 0:
         raise RuntimeError("chunk_size deve ser maior que zero.")
-    start = chunk_index * chunk_size
-    return jobs[start: start + chunk_size]
+    return jobs[chunk_index * chunk_size: (chunk_index + 1) * chunk_size]
 
 
-def filter_jobs_by_request_id(jobs: list[EtlJob], request_id: int | None) -> list[EtlJob]:
-    if request_id is None or request_id == 0:
+def filter_jobs_by_request_id(
+    jobs: list[EtlJob], request_id: int | None
+) -> list[EtlJob]:
+    if not request_id:
         return jobs
     selected = [j for j in jobs if j.request_id == request_id]
     if not selected:
@@ -683,58 +688,53 @@ def parse_request_id_list(raw: str | None) -> set[int]:
     return ids
 
 
-def exclude_jobs_by_request_ids(jobs: list[EtlJob], ids: set[int]) -> list[EtlJob]:
+def exclude_jobs_by_request_ids(
+    jobs: list[EtlJob], ids: set[int]
+) -> list[EtlJob]:
     return [j for j in jobs if j.request_id not in ids] if ids else jobs
 
 
-def chunk_matrix(jobs: list[EtlJob], chunk_size: int) -> str:
-    count = (len(jobs) + chunk_size - 1) // chunk_size
-    return json.dumps({"chunk_index": list(range(count))}, separators=(",", ":"))
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Executa jobs ETL TOTVS configurados no YAML.")
+    parser = argparse.ArgumentParser(
+        description="Executa jobs ETL TOTVS configurados no YAML."
+    )
     parser.add_argument("--chunk-index", type=int, default=0)
     parser.add_argument("--chunk-size", type=int, default=1000)
     parser.add_argument(
         "--lookback-days",
         type=int,
-        default=30,
-        help="Dias para filtro incremental. Use 0 para carga total sem filtro de data.",
+        default=7,
+        help="Dias para filtro incremental. Use 0 para carga total sem filtro.",
     )
     parser.add_argument(
         "--request-id",
         type=int,
         default=0,
-        help="Executa apenas o job com este request_id. Use 0 para executar todos.",
+        help="Executa apenas o job com este request_id. Use 0 para todos.",
     )
     parser.add_argument(
         "--exclude-request-ids",
         default="",
-        help="Lista separada por virgulas de request_ids que devem ser ignorados.",
+        help="Lista separada por virgulas de request_ids a ignorar.",
     )
-    parser.add_argument("--print-chunk-matrix", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     lookback_days = None if args.lookback_days == 0 else args.lookback_days
+
     jobs = load_jobs()
-
-    if args.print_chunk_matrix:
-        print(chunk_matrix(jobs, args.chunk_size))
-        return
-
-    jobs = filter_jobs_by_request_id(jobs, args.request_id)
-    jobs = exclude_jobs_by_request_ids(jobs, parse_request_id_list(args.exclude_request_ids))
+    jobs = filter_jobs_by_request_id(jobs, args.request_id or None)
+    jobs = exclude_jobs_by_request_ids(
+        jobs, parse_request_id_list(args.exclude_request_ids)
+    )
     selected_jobs = chunk_jobs(jobs, args.chunk_index, args.chunk_size)
 
     if not selected_jobs:
-        logger.info("Bloco %s sem jobs; nada a executar.", args.chunk_index)
+        logger.info("Nenhum job selecionado; nada a executar.")
         return
 
-    # Pool de conexoes reutilizadas (QueuePool) — evita handshake SSL a cada flush
     engine = create_engine(
         require_postgres_database_url(),
         poolclass=QueuePool,
@@ -767,10 +767,12 @@ def main() -> None:
         if failed_jobs:
             for tbl, err in failed_jobs.items():
                 logger.error("%s | %s", tbl, err)
-            raise RuntimeError(f"Jobs com falha no bloco: {', '.join(failed_jobs)}")
+            raise RuntimeError(
+                f"Jobs com falha: {', '.join(failed_jobs)}"
+            )
 
     except (KeyError, RuntimeError):
-        logger.exception("Pipeline interrompido por configuracao ou dados invalidos.")
+        logger.exception("Pipeline interrompido.")
         raise
     except Exception:
         logger.exception("Pipeline ETL interrompido.")
