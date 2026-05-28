@@ -46,6 +46,7 @@ UPSERT_BATCH_SIZE = 5000
 POSTGRES_PARAMETER_LIMIT = 60000
 REQUEST_TIMEOUT_SECONDS = 60
 REQUEST_RETRY_COUNT = 3
+DATABASE_WRITE_RETRY_COUNT = 3
 PAGE_LOG_INTERVAL = 10
 BUSINESS_TIMEZONE = ZoneInfo("America/Fortaleza")
 
@@ -486,21 +487,57 @@ def write_page_to_staging(
         min(DB_WRITE_CHUNK_SIZE, POSTGRES_PARAMETER_LIMIT // max(len(dataframe.columns), 1)),
     )
     logger.info(
-        "%s | Enviando %s registros para staging em lotes de ate %s linhas.",
+        "%s | Enviando %s registros para staging em transacoes de ate %s linhas.",
         job.target_table,
         len(dataframe),
         safe_chunksize,
     )
 
-    dataframe.to_sql(
-        job.staging_table,
-        engine,
-        schema=TARGET_SCHEMA,
-        if_exists=if_exists,
-        index=False,
-        chunksize=safe_chunksize,
-        method="multi",
-    )
+    next_if_exists = if_exists
+    total_rows = len(dataframe)
+    for start in range(0, total_rows, safe_chunksize):
+        end = min(start + safe_chunksize, total_rows)
+        chunk = dataframe.iloc[start:end]
+
+        for attempt in range(1, DATABASE_WRITE_RETRY_COUNT + 2):
+            try:
+                chunk.to_sql(
+                    job.staging_table,
+                    engine,
+                    schema=TARGET_SCHEMA,
+                    if_exists=next_if_exists,
+                    index=False,
+                    chunksize=safe_chunksize,
+                    method="multi",
+                )
+                break
+            except SQLAlchemyError:
+                if attempt <= DATABASE_WRITE_RETRY_COUNT:
+                    wait_seconds = 2 * attempt
+                    logger.warning(
+                        "%s | Falha transiente ao gravar staging linhas %s-%s de %s. "
+                        "Tentativa %s/%s; aguardando %ss.",
+                        job.target_table,
+                        start + 1,
+                        end,
+                        total_rows,
+                        attempt,
+                        DATABASE_WRITE_RETRY_COUNT + 1,
+                        wait_seconds,
+                        exc_info=True,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise
+
+        next_if_exists = "append"
+        if end == total_rows or end % max(safe_chunksize * 10, 1) == 0:
+            logger.info(
+                "%s | Staging gravado ate a linha %s de %s.",
+                job.target_table,
+                end,
+                total_rows,
+            )
 
 
 def flush_staging_buffer(
