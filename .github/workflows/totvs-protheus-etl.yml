@@ -16,8 +16,6 @@ on:
   schedule:
     # GitHub cron uses UTC. Runs at 13:00 America/Fortaleza with 30 days of history.
     - cron: "0 16 * * *"
-    # Runs daily at 02:00 America/Fortaleza with 60 days of history.
-    - cron: "0 5 * * *"
 
 permissions:
   contents: read
@@ -34,7 +32,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' ||
       inputs.request_id == '0' ||
-      (inputs.request_id != '17' && inputs.request_id != '28' && inputs.request_id != '44')
+      (inputs.request_id != '17' && inputs.request_id != '28' && inputs.request_id != '44' && inputs.request_id != '45')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,16 +54,13 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LOOKBACK_DAYS="${{ inputs.lookback_days }}"
             REQUEST_ID="${{ inputs.request_id }}"
-          elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
-            LOOKBACK_DAYS="60"
-            REQUEST_ID="0"
           else
             LOOKBACK_DAYS="30"
             REQUEST_ID="0"
           fi
 
           if [ "$REQUEST_ID" = "0" ]; then
-            python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS" --exclude-request-ids "17,28,44"
+            python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS" --exclude-request-ids "17,28,44,45"
           else
             python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS" --request-id "$REQUEST_ID"
           fi
@@ -98,8 +93,6 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LOOKBACK_DAYS="${{ inputs.lookback_days }}"
-          elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
-            LOOKBACK_DAYS="60"
           else
             LOOKBACK_DAYS="30"
           fi
@@ -134,8 +127,6 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LOOKBACK_DAYS="${{ inputs.lookback_days }}"
-          elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
-            LOOKBACK_DAYS="60"
           else
             LOOKBACK_DAYS="30"
           fi
@@ -170,10 +161,42 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             LOOKBACK_DAYS="${{ inputs.lookback_days }}"
-          elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
-            LOOKBACK_DAYS="60"
           else
             LOOKBACK_DAYS="30"
           fi
 
           python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS" --request-id 44
+
+  run-etl-se2:
+    name: ETL SE2
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.request_id == '0' ||
+      inputs.request_id == '45'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Run SE2 ETL
+        env:
+          API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            LOOKBACK_DAYS="${{ inputs.lookback_days }}"
+          else
+            LOOKBACK_DAYS="30"
+          fi
+
+          python totvs_protheus_etl.py --chunk-index 0 --chunk-size 1000 --lookback-days "$LOOKBACK_DAYS" --request-id 45
