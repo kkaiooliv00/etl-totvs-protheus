@@ -381,10 +381,8 @@ def _copy_dataframe_to_staging(
             col_defs = []
             for col in df.columns:
                 dtype = str(df[col].dtype)
-                if "int" in dtype:
-                    pg_type = "BIGINT"
-                elif "float" in dtype:
-                    pg_type = "DOUBLE PRECISION"
+                if "int" in dtype or "float" in dtype:
+                    pg_type = "NUMERIC"
                 elif "bool" in dtype:
                     pg_type = "BOOLEAN"
                 elif "datetime" in dtype:
