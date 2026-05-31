@@ -15,11 +15,6 @@ on:
         required: true
         type: string
         default: "0"
-
-  schedule:
-    # Seg-Sex, 13h Fortaleza (16h UTC). Nao roda sabado nem domingo.
-    - cron: "0 16 * * 1-5"
-
 permissions:
   contents: read
 
@@ -66,6 +61,13 @@ jobs:
               --lookback-days "${{ steps.params.outputs.lookback_days }}" \
               --request-id "${{ inputs.request_id }}"
           else
+            echo "Executando job principal sem o request_id 45."
             python totvs_protheus_etl.py \
-              --lookback-days "${{ steps.params.outputs.lookback_days }}"
+              --lookback-days "${{ steps.params.outputs.lookback_days }}" \
+              --exclude-request-ids "45"
+
+            echo "Executando request_id 45 apos finalizar o job principal, com lookback fixo de 60 dias."
+            python totvs_protheus_etl.py \
+              --lookback-days "60" \
+              --request-id "45"
           fi
