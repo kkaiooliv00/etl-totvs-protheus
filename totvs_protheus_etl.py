@@ -747,6 +747,8 @@ def main() -> None:
     try:
         preflight_database_connection(engine)
 
+        logger.info("Jobs selecionados: %s.", [job.request_id for job in selected_jobs])
+
         for job in selected_jobs:
             try:
                 run_job(engine, job, lookback_days)
