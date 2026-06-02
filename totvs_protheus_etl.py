@@ -119,6 +119,14 @@ def _normalize_dsn(database_url: str) -> str:
     )
 
 
+def _sqlalchemy_database_url(database_url: str) -> str:
+    if database_url.startswith("postgresql://"):
+        return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    if database_url.startswith("postgres://"):
+        return database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    return database_url
+
+
 def preflight_database_connection(engine: Engine) -> None:
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
@@ -734,7 +742,7 @@ def main() -> None:
         return
 
     engine = create_engine(
-        require_postgres_database_url(),
+        _sqlalchemy_database_url(require_postgres_database_url()),
         poolclass=QueuePool,
         pool_size=5,
         max_overflow=2,
