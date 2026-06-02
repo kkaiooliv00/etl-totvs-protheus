@@ -43,7 +43,7 @@ API_URL = (
     "https://transagil202609.protheus.cloudtotvs.com.br:11258"
     "/rest/v1/hypersync/request"
 )
-API_USER = "kaio.dantas"
+API_USER_ENV = "API_PROTHEUS_USER"
 API_PASSWORD_ENV = "API_PROTHEUS_PASSWORD"
 DATABASE_URL_ENV = "DATABASE_URL"
 
@@ -106,7 +106,7 @@ def require_postgres_database_url() -> str:
     if scheme not in ("postgresql", "postgresql+psycopg", "postgres"):
         raise RuntimeError(
             "DATABASE_URL invalida. Use uma URL PostgreSQL como "
-            "postgresql+psycopg://usuario:senha@host:5432/postgres."
+            "postgresql+psycopg://usuario:senha@host:6543/postgres."
         )
     return database_url
 
@@ -293,7 +293,7 @@ def iter_api_pages(
     """Pagina a API sequencialmente, uma pagina por vez."""
     password = require_env(API_PASSWORD_ENV)
     session = requests.Session()
-    session.auth = (API_USER, password)
+    session.auth = (require_env(API_USER_ENV), password)
     session.headers.update({"Content-Type": "application/json"})
 
     try:
