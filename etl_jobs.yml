@@ -58,6 +58,9 @@ jobs:
     target_table: SF4
   - request_id: 44
     target_table: STL
+  - request_id: 45
+    target_table: SE2
+    date_parameter: E2_EMISSAO
   - request_id: 47
     target_table: STJ
     date_parameter: TJ_DTORIGI
