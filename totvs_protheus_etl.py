@@ -336,6 +336,11 @@ def iter_api_pages(
 # ── Transformacao ─────────────────────────────────────────────────────────────
 
 def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Normaliza os registros e garante a presenca da business key.
+
+    A deduplicacao e feita em uma unica etapa no banco de dados via
+    create_dedup_staging() (ROW_NUMBER + ctid DESC), antes do upsert final.
+    """
     df = pd.json_normalize(records, sep="_")
     if df.empty:
         return df
@@ -359,15 +364,6 @@ def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFram
         raise KeyError(
             f"Coluna obrigatoria ausente: {job.business_key}. "
             f"Colunas recebidas em {job.target_table}: {received}"
-        )
-
-    initial_count = len(df)
-    df = df.drop_duplicates(subset=[job.business_key], keep="last")
-    dropped = initial_count - len(df)
-    if dropped > 0:
-        logger.warning(
-            "%s | %s registros duplicados removidos na memoria (chave: %s).",
-            job.target_table, dropped, job.business_key
         )
 
     return df
@@ -495,6 +491,54 @@ def add_missing_target_columns(
         )
 
 
+def deduplicate_target_table(connection: Connection, job: EtlJob) -> None:
+    """Remove duplicatas da tabela alvo antes de criar a UNIQUE constraint.
+
+    Necessario quando a tabela ja existia sem constraint e acumulou
+    duplicatas em execucoes anteriores. Mantem o registro de menor ctid
+    (o mais antigo fisicamente) para cada business_key.
+    Se a tabela ainda nao existir, nao faz nada.
+    """
+    target = qualified_table(TARGET_SCHEMA, job.target_table)
+    key = quote_identifier(job.business_key)
+
+    # Verifica se a tabela existe antes de tentar limpar
+    table_exists = connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_class t
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE t.relname = :tn AND n.nspname = :sn
+            )
+            """
+        ),
+        {"tn": job.target_table, "sn": TARGET_SCHEMA},
+    ).scalar_one()
+
+    if not table_exists:
+        return
+
+    result = connection.execute(
+        text(
+            f"""
+            DELETE FROM {target}
+            WHERE ctid NOT IN (
+                SELECT MIN(ctid)
+                FROM {target}
+                GROUP BY {key}
+            )
+            """
+        )
+    )
+    if result.rowcount > 0:
+        logger.warning(
+            "%s | %s registros duplicados removidos da tabela alvo antes de criar constraint.",
+            job.target_table, result.rowcount,
+        )
+
+
 def ensure_unique_constraint(connection: Connection, job: EtlJob) -> None:
     target = qualified_table(TARGET_SCHEMA, job.target_table)
     constraint_name = f"{job.target_table}_{job.business_key}_uk"
@@ -592,6 +636,7 @@ def finalize_load(engine: Engine, job: EtlJob, columns: list[str]) -> None:
     with engine.begin() as conn:
         create_target_from_staging(conn, job)
         add_missing_target_columns(conn, engine, job)
+        deduplicate_target_table(conn, job)   # limpa duplicatas antes de criar constraint
         ensure_unique_constraint(conn, job)
         create_dedup_staging(conn, job, columns)
         upsert_from_staging(conn, job, columns)
@@ -629,8 +674,12 @@ def run_job(engine: Engine, job: EtlJob, lookback_days: int | None) -> None:
             if df.empty:
                 continue
 
-            if columns is None:
-                columns = list(df.columns)
+            # Acumula a uniao de todas as colunas vistas ate agora.
+            # Paginas posteriores da API podem retornar campos extras;
+            # ignora-los causaria erro no COPY ou perda silenciosa de dados.
+            new_cols = [c for c in df.columns if c not in (columns or [])]
+            if new_cols:
+                columns = list(columns or []) + new_cols
 
             buffer_frames.append(df)
             buffer_records += len(df)
