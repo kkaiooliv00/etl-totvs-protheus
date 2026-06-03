@@ -49,7 +49,7 @@ DATABASE_URL_ENV = "DATABASE_URL"
 
 JOB_CONFIG_PATH = Path(os.getenv("ETL_JOBS_FILE", "etl_jobs.yml"))
 START_PAGE = 1
-PAGE_SIZE = 100
+PAGE_SIZE = 200
 
 # ── Tuning ───────────────────────────────────────────────────────────────────
 # Requisicoes sequenciais — sem paralelismo (servidor TOTVS nao suporta).
