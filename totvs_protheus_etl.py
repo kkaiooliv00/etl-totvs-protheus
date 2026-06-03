@@ -316,11 +316,19 @@ def iter_api_pages(
 
             yield page, items
 
-            if not items or len(items) < PAGE_SIZE:
+            if not items:
                 logger.info(
-                    "%s | Paginacao encerrada na pagina %s.", job.target_table, page
+                    "%s | Paginacao encerrada: pagina %s retornou 0 registros.", 
+                    job.target_table, page
                 )
                 break
+
+            if len(items) < PAGE_SIZE:
+                logger.warning(
+                    "%s | Pagina %s retornou %s registros (menor que o pageSize %s). "
+                    "Continuando para garantir a extração total.",
+                    job.target_table, page, len(items), PAGE_SIZE
+                )
     finally:
         session.close()
 
@@ -353,7 +361,16 @@ def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFram
             f"Colunas recebidas em {job.target_table}: {received}"
         )
 
-    return df.drop_duplicates(subset=[job.business_key], keep="last")
+    initial_count = len(df)
+    df = df.drop_duplicates(subset=[job.business_key], keep="last")
+    dropped = initial_count - len(df)
+    if dropped > 0:
+        logger.warning(
+            "%s | %s registros duplicados removidos na memoria (chave: %s).",
+            job.target_table, dropped, job.business_key
+        )
+
+    return df
 
 
 # ── Escrita no staging via COPY (psycopg3) ────────────────────────────────────
@@ -516,7 +533,7 @@ def create_dedup_staging(
     key = quote_identifier(job.business_key)
 
     connection.execute(text(f"DROP TABLE IF EXISTS {dedup}"))
-    connection.execute(
+    result = connection.execute(
         text(
             f"""
             CREATE TABLE {dedup} AS
@@ -532,6 +549,10 @@ def create_dedup_staging(
             """
         )
     )
+
+    count_res = connection.execute(text(f"SELECT count(*) FROM {dedup}"))
+    count = count_res.scalar_one()
+    logger.info("%s | Staging deduplicado criado com %s registros.", job.target_table, count)
 
 
 def upsert_from_staging(
