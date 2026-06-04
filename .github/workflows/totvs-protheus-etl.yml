@@ -51,7 +51,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
           else
-            echo "lookback_days=7" >> "$GITHUB_OUTPUT"
+            echo "lookback_days=30" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Executar ETL
