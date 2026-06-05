@@ -254,6 +254,22 @@ def _fetch_page_sync(
                     job.target_table, response.status_code, page,
                     response.text[:500],
                 )
+
+            # Erros 5xx sao transientes: aplica retry com backoff
+            if response.status_code >= 500:
+                exc_5xx = requests.HTTPError(
+                    f"HTTP {response.status_code}", response=response
+                )
+                if attempt <= REQUEST_RETRY_COUNT:
+                    wait = 4 * attempt  # backoff maior para erros de servidor
+                    logger.warning(
+                        "%s | Erro 5xx pagina %s tentativa %s/%s; aguardando %ss.",
+                        job.target_table, page, attempt, REQUEST_RETRY_COUNT + 1, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise exc_5xx
+
             response.raise_for_status()
 
             text_body = _decode_response(response.content)
@@ -520,15 +536,15 @@ def deduplicate_target_table(connection: Connection, job: EtlJob) -> None:
     if not table_exists:
         return
 
+    # DELETE ... USING com self-join e muito mais eficiente que NOT IN para
+    # tabelas grandes: evita full scan duplo e nao estoura statement_timeout.
     result = connection.execute(
         text(
             f"""
-            DELETE FROM {target}
-            WHERE ctid NOT IN (
-                SELECT MIN(ctid)
-                FROM {target}
-                GROUP BY {key}
-            )
+            DELETE FROM {target} t1
+            USING {target} t2
+            WHERE t1.{key} = t2.{key}
+              AND t1.ctid > t2.ctid
             """
         )
     )
