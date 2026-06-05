@@ -6,13 +6,11 @@ jobs:
     date_parameter: C1_EMISSAO
   - request_id: 18
     target_table: SC8
-    date_parameter: C8_DATA
   - request_id: 19
     target_table: SC7
     date_parameter: C7_EMISSAO
   - request_id: 20
     target_table: SD1
-    date_parameter: D1_EMISSAO
   - request_id: 21
     target_table: SF1
     date_parameter: F1_EMISSAO
@@ -40,7 +38,6 @@ jobs:
     business_key: r_e_c_n_o_
   - request_id: 36
     target_table: SCQ
-    date_parameter: CQ_DATA
   - request_id: 37
     target_table: D03
   - request_id: 38
@@ -50,7 +47,6 @@ jobs:
     target_table: SF5
   - request_id: 40
     target_table: SB2
-    date_parameter: B2_UENT
   - request_id: 42
     target_table: SF4
   - request_id: 44
