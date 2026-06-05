@@ -1,7 +1,4 @@
 jobs:
-  - request_id: 6
-    target_table: custos_compras
-    date_parameter: E2_EMISSAO
   - request_id: 16
     target_table: Tempo_medio_pagamento
   - request_id: 17

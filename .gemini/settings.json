@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "supabase": {
+      "command": "https://mcp.supabase.com/mcp?project_ref=uedzntjrxgrkxjzdyaowgemini",
+      "args": [
+        "mcp",
+        "add",
+        "supabase",
+        "https://mcp.supabase.com/mcp?project_ref=uedzntjrxgrkxjzdyaow"
+      ]
+    }
+  }
+}
