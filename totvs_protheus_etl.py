@@ -195,8 +195,18 @@ def format_start_date(lookback_days: int) -> str:
 def _build_body(job: EtlJob, page: int, lookback_days: int | None) -> dict[str, Any]:
     data: dict[str, Any] = {"page": page, "pageSize": PAGE_SIZE}
     if job.date_parameter and lookback_days:
-        data[job.date_parameter] = format_start_date(lookback_days)
-    return {"id": job.request_id, "data": data}
+        start_date = format_start_date(lookback_days)
+        params = f"{job.date_parameter} >= {start_date} AND D_E_L_E_T_ = ' '"
+        data["params"] = params
+        if page == START_PAGE:
+            logger.info(
+                "%s | Filtro de data aplicado: params='%s' (lookback_days=%s).",
+                job.target_table, params, lookback_days,
+            )
+    body = {"id": job.request_id, "data": data}
+    if page == START_PAGE:
+        logger.debug("%s | Body pagina 1: %s", job.target_table, json.dumps(body, ensure_ascii=False))
+    return body
 
 
 def _decode_response(raw_bytes: bytes) -> str:
@@ -310,6 +320,11 @@ def _fetch_page_sync(
     return []  # nunca atingido
 
 
+# Limite de alerta: se o job tem filtro de data e ultrapassa esse numero de
+# registros acumulados, loga um aviso de que o filtro pode estar sendo ignorado.
+_DATE_FILTER_SUSPICIOUS_RECORD_THRESHOLD = 150_000
+
+
 def iter_api_pages(
     job: EtlJob,
     lookback_days: int | None,
@@ -320,14 +335,34 @@ def iter_api_pages(
     session.auth = (require_env(API_USER_ENV), password)
     session.headers.update({"Content-Type": "application/json"})
 
+    total_extracted = 0
+    date_filter_warned = False
+
     try:
         for page in range(START_PAGE, 99_999):
             items = _fetch_page_sync(session, job, page, lookback_days)
+            total_extracted += len(items)
 
             if page == START_PAGE or page % PAGE_LOG_INTERVAL == 0:
                 logger.info(
-                    "%s | Pagina %s extraida com %s registros.",
-                    job.target_table, page, len(items),
+                    "%s | Pagina %s extraida com %s registros (total acumulado: %s).",
+                    job.target_table, page, len(items), total_extracted,
+                )
+
+            # Alerta: filtro de data configurado mas volume esta suspeitamente alto
+            if (
+                not date_filter_warned
+                and job.date_parameter
+                and lookback_days
+                and total_extracted >= _DATE_FILTER_SUSPICIOUS_RECORD_THRESHOLD
+            ):
+                date_filter_warned = True
+                logger.warning(
+                    "%s | ATENCAO: filtro de data '%s' configurado com lookback_days=%s, "
+                    "mas ja foram extraidos %s registros (>= %s). "
+                    "Verifique se a API esta realmente aplicando o filtro.",
+                    job.target_table, job.date_parameter, lookback_days,
+                    total_extracted, _DATE_FILTER_SUSPICIOUS_RECORD_THRESHOLD,
                 )
 
             yield page, items
@@ -649,14 +684,43 @@ def upsert_from_staging(
 
 
 def finalize_load(engine: Engine, job: EtlJob, columns: list[str]) -> None:
-    with engine.begin() as conn:
-        create_target_from_staging(conn, job)
-        add_missing_target_columns(conn, engine, job)
-        deduplicate_target_table(conn, job)   # limpa duplicatas antes de criar constraint
-        ensure_unique_constraint(conn, job)
-        create_dedup_staging(conn, job, columns)
-        upsert_from_staging(conn, job, columns)
-        drop_staging_tables(conn, job)
+    logger.info("%s | Iniciando finalize_load.", job.target_table)
+    try:
+        with engine.begin() as conn:
+            t0 = time.perf_counter()
+            create_target_from_staging(conn, job)
+            logger.info("%s | create_target_from_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            add_missing_target_columns(conn, engine, job)
+            logger.info("%s | add_missing_target_columns: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            deduplicate_target_table(conn, job)
+            logger.info("%s | deduplicate_target_table: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            ensure_unique_constraint(conn, job)
+            logger.info("%s | ensure_unique_constraint: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            create_dedup_staging(conn, job, columns)
+            logger.info("%s | create_dedup_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            upsert_from_staging(conn, job, columns)
+            logger.info("%s | upsert_from_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            drop_staging_tables(conn, job)
+            logger.info("%s | drop_staging_tables: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+    except Exception:
+        logger.exception(
+            "%s | Falha em finalize_load. Tabelas de staging preservadas para inspecao: %s, %s.",
+            job.target_table, job.staging_table, job.dedup_staging_table,
+        )
+        raise
 
 
 # ── Orquestrador por job ──────────────────────────────────────────────────────
