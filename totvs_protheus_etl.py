@@ -876,6 +876,74 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+JOB_MAX_ATTEMPTS = 3
+
+
+def _run_job_with_retry(
+    job: EtlJob,
+    lookback_days: int | None,
+    job_index: int,
+    total_jobs: int,
+) -> str | None:
+    """Executa um job com retry (ate JOB_MAX_ATTEMPTS tentativas).
+
+    Cada tentativa cria e descarta seu proprio engine para garantir
+    isolamento total de conexoes entre jobs.
+
+    Retorna None em caso de sucesso, ou a mensagem de erro em caso de falha
+    definitiva apos todas as tentativas.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, JOB_MAX_ATTEMPTS + 1):
+        engine: Engine | None = None
+        try:
+            engine = create_engine(
+                _sqlalchemy_database_url(require_postgres_database_url()),
+                poolclass=QueuePool,
+                pool_size=5,
+                max_overflow=2,
+                pool_pre_ping=True,
+            )
+            run_job(engine, job, lookback_days)
+            logger.info(
+                "Job %s/%s | request_id=%s | tabela=%s concluido com sucesso"
+                " na tentativa %s/%s.",
+                job_index, total_jobs,
+                job.request_id, job.target_table,
+                attempt, JOB_MAX_ATTEMPTS,
+            )
+            return None  # sucesso
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < JOB_MAX_ATTEMPTS:
+                wait = 10 * attempt  # backoff: 10s na 1a falha, 20s na 2a
+                logger.warning(
+                    "Job request_id=%s target_table=%s falhou na tentativa"
+                    " %s/%s. Aguardando %ss antes de tentar novamente. Erro: %s",
+                    job.request_id, job.target_table,
+                    attempt, JOB_MAX_ATTEMPTS, wait, exc,
+                )
+                time.sleep(wait)
+            else:
+                logger.exception(
+                    "Job request_id=%s target_table=%s falhou em todas as"
+                    " %s tentativas.",
+                    job.request_id, job.target_table, JOB_MAX_ATTEMPTS,
+                )
+
+        finally:
+            if engine is not None:
+                engine.dispose()
+                logger.debug(
+                    "%s | Engine descartado apos tentativa %s.",
+                    job.target_table, attempt,
+                )
+
+    return f"{type(last_exc).__name__}: {last_exc}"
+
+
 def main() -> None:
     args = parse_args()
     lookback_days = None if args.lookback_days == 0 else args.lookback_days
@@ -891,40 +959,58 @@ def main() -> None:
         logger.info("Nenhum job selecionado; nada a executar.")
         return
 
-    engine = create_engine(
+    # Valida conexao com o banco uma unica vez antes de comecar
+    _preflight_engine = create_engine(
         _sqlalchemy_database_url(require_postgres_database_url()),
         poolclass=QueuePool,
-        pool_size=5,
-        max_overflow=2,
+        pool_size=1,
+        max_overflow=0,
         pool_pre_ping=True,
+    )
+    try:
+        preflight_database_connection(_preflight_engine)
+    finally:
+        _preflight_engine.dispose()
+
+    logger.info(
+        "Jobs selecionados (%s no total): %s.",
+        len(selected_jobs),
+        [job.request_id for job in selected_jobs],
     )
 
     failed_jobs: dict[str, str] = {}
     succeeded_jobs: list[str] = []
 
     try:
-        preflight_database_connection(engine)
+        for job_index, job in enumerate(selected_jobs, start=1):
+            logger.info(
+                "%-60s", "=" * 60,
+            )
+            logger.info(
+                "Iniciando job %s/%s | request_id=%s | tabela=%s.",
+                job_index, len(selected_jobs), job.request_id, job.target_table,
+            )
 
-        logger.info("Jobs selecionados: %s.", [job.request_id for job in selected_jobs])
+            error_msg = _run_job_with_retry(
+                job, lookback_days, job_index, len(selected_jobs)
+            )
 
-        for job in selected_jobs:
-            try:
-                run_job(engine, job, lookback_days)
+            if error_msg is None:
                 succeeded_jobs.append(job.target_table)
-            except Exception as exc:
-                logger.exception(
-                    "Job request_id=%s target_table=%s falhou.",
-                    job.request_id, job.target_table,
-                )
-                failed_jobs[job.target_table] = f"{type(exc).__name__}: {exc}"
+            else:
+                failed_jobs[job.target_table] = error_msg
 
+        logger.info("%-60s", "=" * 60)
         logger.info(
-            "Resumo: %s jobs com sucesso, %s jobs com falha.",
+            "Pipeline concluido: %s jobs com sucesso, %s jobs com falha.",
             len(succeeded_jobs), len(failed_jobs),
         )
+        if succeeded_jobs:
+            logger.info("Sucesso: %s.", ", ".join(succeeded_jobs))
         if failed_jobs:
+            logger.error("Falhas ao final do pipeline:")
             for tbl, err in failed_jobs.items():
-                logger.error("%s | %s", tbl, err)
+                logger.error("  %s => %s", tbl, err)
             raise RuntimeError(
                 f"Jobs com falha: {', '.join(failed_jobs)}"
             )
@@ -935,8 +1021,6 @@ def main() -> None:
     except Exception:
         logger.exception("Pipeline ETL interrompido.")
         raise
-    finally:
-        engine.dispose()
 
 
 if __name__ == "__main__":
