@@ -53,8 +53,20 @@ PAGE_SIZE = 200
 
 # ── Tuning ───────────────────────────────────────────────────────────────────
 # Requisicoes sequenciais — sem paralelismo (servidor TOTVS nao suporta).
-REQUEST_TIMEOUT_SECONDS = 60
+# Timeout de CONEXAO separado do timeout de LEITURA:
+#   - CONNECT_TIMEOUT_SECONDS (15s): tempo maximo para estabelecer o TCP/TLS.
+#     Curto de proposito — se o servidor nao aceitar a conexao logo, falha
+#     rapido e entra no retry exponencial, evitando travar por 60s.
+#   - READ_TIMEOUT_SECONDS (90s): tempo maximo aguardando a resposta da API
+#     apos a conexao estar estabelecida. Maior pois algumas queries sao lentas.
+CONNECT_TIMEOUT_SECONDS = 15
+READ_TIMEOUT_SECONDS = 90
 REQUEST_RETRY_COUNT = 3
+
+# Pausa entre jobs consecutivos (segundos). Evita rate limiting / cooldown
+# do servidor TOTVS quando varias conexoes sao abertas em sequencia rapida.
+# Pode ser sobrescrito via --job-delay-seconds 0 para desabilitar.
+DEFAULT_JOB_DELAY_SECONDS = 15
 
 # Registros acumulados antes de despejar no staging via COPY.
 STAGING_FLUSH_RECORDS = 10_000
@@ -256,7 +268,7 @@ def _fetch_page_sync(
             response = session.post(
                 API_URL,
                 json=body,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
             )
             if response.status_code >= 400:
                 logger.error(
@@ -873,6 +885,15 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Lista separada por virgulas de request_ids a ignorar.",
     )
+    parser.add_argument(
+        "--job-delay-seconds",
+        type=int,
+        default=DEFAULT_JOB_DELAY_SECONDS,
+        help=(
+            "Pausa em segundos entre jobs consecutivos. "
+            "Evita rate limiting do servidor TOTVS. Use 0 para desabilitar."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -999,6 +1020,14 @@ def main() -> None:
                 succeeded_jobs.append(job.target_table)
             else:
                 failed_jobs[job.target_table] = error_msg
+
+            # Pausa entre jobs para evitar rate limiting / cooldown do servidor
+            if job_index < len(selected_jobs) and args.job_delay_seconds > 0:
+                logger.info(
+                    "Aguardando %ss antes do proximo job (--job-delay-seconds).",
+                    args.job_delay_seconds,
+                )
+                time.sleep(args.job_delay_seconds)
 
         logger.info("%-60s", "=" * 60)
         logger.info(
