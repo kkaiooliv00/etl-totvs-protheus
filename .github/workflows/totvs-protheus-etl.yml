@@ -16,8 +16,8 @@ on:
         type: string
         default: "0"
   schedule:
-    # Todos os dias, 03h Fortaleza/Recife (06h UTC).
-    - cron: "0 6 * * *"
+    # Todos os dias, 01h30 Fortaleza/Recife (04h30 UTC).
+    - cron: "30 4 * * *"
 permissions:
   contents: read
 
