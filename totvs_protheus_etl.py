@@ -208,7 +208,7 @@ def _build_body(job: EtlJob, page: int, lookback_days: int | None) -> dict[str, 
     data: dict[str, Any] = {"page": page, "pageSize": PAGE_SIZE}
     if job.date_parameter and lookback_days:
         start_date = format_start_date(lookback_days)
-        params = f"{job.date_parameter} >= {start_date} AND D_E_L_E_T_ = ' '"
+        params = f"{job.date_parameter} >= {start_date}"
         data["params"] = params
         if page == START_PAGE:
             logger.info(
