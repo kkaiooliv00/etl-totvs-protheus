@@ -57,3 +57,5 @@ jobs:
   - request_id: 47
     target_table: STJ
     date_parameter: TJ_DTORIGI
+  - request_id: 49
+    target_table: NNR
