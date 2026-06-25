@@ -33,6 +33,8 @@ jobs:
     business_key: usr_id
   - request_id: 32
     target_table: SED
+  - request_id: 33
+    target_table: SB2
   - request_id: 34
     target_table: SB1
     business_key: r_e_c_n_o_
