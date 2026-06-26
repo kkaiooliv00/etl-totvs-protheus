@@ -61,3 +61,6 @@ jobs:
     date_parameter: TJ_DTORIGI
   - request_id: 49
     target_table: NNR
+  - request_id: 50
+    target_table: STF
+    date_parameter: TF_DTULTIMA
