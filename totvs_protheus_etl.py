@@ -399,7 +399,11 @@ def iter_api_pages(
 # ── Transformacao ─────────────────────────────────────────────────────────────
 
 def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFrame:
-    """Normaliza os registros e garante a presenca da business key.
+    """Normaliza os registros e garante a presenca da business key quando possivel.
+
+    Se a business_key nao existir nos dados E nao houver business_key_columns
+    configuradas, o DataFrame e retornado sem a coluna de chave. Nesse caso,
+    finalize_load realizara um INSERT total (sem upsert) na tabela destino.
 
     A deduplicacao e feita em uma unica etapa no banco de dados via
     create_dedup_staging() (ROW_NUMBER + ctid DESC), antes do upsert final.
@@ -423,10 +427,12 @@ def transform_records(job: EtlJob, records: list[dict[str, Any]]) -> pd.DataFram
         )
 
     if job.business_key not in df.columns:
-        received = ", ".join(str(c) for c in df.columns)
-        raise KeyError(
-            f"Coluna obrigatoria ausente: {job.business_key}. "
-            f"Colunas recebidas em {job.target_table}: {received}"
+        logger.warning(
+            "%s | business_key '%s' ausente nos dados e sem business_key_columns "
+            "configuradas. Carga sera realizada como INSERT total (sem upsert). "
+            "Colunas recebidas: %s",
+            job.target_table, job.business_key,
+            ", ".join(str(c) for c in df.columns),
         )
 
     return df
@@ -695,6 +701,41 @@ def upsert_from_staging(
     )
 
 
+def insert_all_from_staging(
+    connection: Connection, job: EtlJob, columns: list[str]
+) -> None:
+    """Realiza INSERT total do staging para a tabela destino (sem upsert).
+
+    Utilizado quando a tabela nao possui super_chave. A tabela destino e
+    truncada antes do INSERT para evitar duplicatas entre execucoes.
+    """
+    quoted_cols = ", ".join(quote_identifier(c) for c in columns)
+    staging = qualified_table(TARGET_SCHEMA, job.staging_table)
+    target = qualified_table(TARGET_SCHEMA, job.target_table)
+
+    connection.execute(text(f"TRUNCATE TABLE {target}"))
+    result = connection.execute(
+        text(
+            f"INSERT INTO {target} ({quoted_cols}) "
+            f"SELECT {quoted_cols} FROM {staging}"
+        )
+    )
+    logger.info(
+        "%s | INSERT total concluido (sem super_chave): %s linhas inseridas.",
+        job.target_table, result.rowcount,
+    )
+
+
+def _staging_has_business_key(connection: Connection, job: EtlJob) -> bool:
+    """Verifica se a coluna business_key existe na tabela de staging."""
+    inspector = inspect(connection)
+    staging_columns = {
+        col["name"]
+        for col in inspector.get_columns(job.staging_table, schema=TARGET_SCHEMA)
+    }
+    return job.business_key in staging_columns
+
+
 def finalize_load(engine: Engine, job: EtlJob, columns: list[str]) -> None:
     logger.info("%s | Iniciando finalize_load.", job.target_table)
     try:
@@ -707,21 +748,35 @@ def finalize_load(engine: Engine, job: EtlJob, columns: list[str]) -> None:
             add_missing_target_columns(conn, engine, job)
             logger.info("%s | add_missing_target_columns: %.1fs.", job.target_table, time.perf_counter() - t0)
 
-            t0 = time.perf_counter()
-            deduplicate_target_table(conn, job)
-            logger.info("%s | deduplicate_target_table: %.1fs.", job.target_table, time.perf_counter() - t0)
+            has_key = _staging_has_business_key(conn, job)
 
-            t0 = time.perf_counter()
-            ensure_unique_constraint(conn, job)
-            logger.info("%s | ensure_unique_constraint: %.1fs.", job.target_table, time.perf_counter() - t0)
+            if not has_key:
+                # Tabela sem super_chave: realiza INSERT total (TRUNCATE + INSERT)
+                logger.info(
+                    "%s | super_chave '%s' ausente na tabela de staging. "
+                    "Executando INSERT total (TRUNCATE + INSERT).",
+                    job.target_table, job.business_key,
+                )
+                t0 = time.perf_counter()
+                insert_all_from_staging(conn, job, columns)
+                logger.info("%s | insert_all_from_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+            else:
+                # Tabela com super_chave: fluxo normal de upsert
+                t0 = time.perf_counter()
+                deduplicate_target_table(conn, job)
+                logger.info("%s | deduplicate_target_table: %.1fs.", job.target_table, time.perf_counter() - t0)
 
-            t0 = time.perf_counter()
-            create_dedup_staging(conn, job, columns)
-            logger.info("%s | create_dedup_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+                t0 = time.perf_counter()
+                ensure_unique_constraint(conn, job)
+                logger.info("%s | ensure_unique_constraint: %.1fs.", job.target_table, time.perf_counter() - t0)
 
-            t0 = time.perf_counter()
-            upsert_from_staging(conn, job, columns)
-            logger.info("%s | upsert_from_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+                t0 = time.perf_counter()
+                create_dedup_staging(conn, job, columns)
+                logger.info("%s | create_dedup_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
+
+                t0 = time.perf_counter()
+                upsert_from_staging(conn, job, columns)
+                logger.info("%s | upsert_from_staging: %.1fs.", job.target_table, time.perf_counter() - t0)
 
             t0 = time.perf_counter()
             drop_staging_tables(conn, job)
