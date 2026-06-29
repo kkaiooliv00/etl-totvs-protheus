@@ -66,3 +66,7 @@ jobs:
     date_parameter: TF_DTULTIMA
   - request_id: 51
     target_table: STI
+  - request_id: 52
+    target_table: ST9
+  - request_id: 53
+    target_table: ST6
