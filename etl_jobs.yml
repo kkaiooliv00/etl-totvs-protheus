@@ -70,3 +70,5 @@ jobs:
     target_table: ST9
   - request_id: 53
     target_table: ST6
+  - request_id: 54
+    target_table: ST4
