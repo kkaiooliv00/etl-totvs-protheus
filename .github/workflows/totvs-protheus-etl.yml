@@ -16,10 +16,8 @@ on:
         type: string
         default: "0"
   schedule:
-    # Segunda a sexta, 23h00 Fortaleza/Recife (02h00 UTC).
-    - cron: "0 2 * * 1-5"
-    # Domingo, 23h00 Fortaleza/Recife (02h00 UTC).
-    - cron: "0 2 * * 0"
+    # Domingo a sexta, 01h00 Fortaleza/Recife (04h00 UTC).
+    - cron: "0 4 * * 0-5"
 permissions:
   contents: read
 
