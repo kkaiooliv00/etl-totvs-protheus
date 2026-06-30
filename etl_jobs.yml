@@ -1,6 +1,4 @@
 jobs:
-  - request_id: 16
-    target_table: Tempo_medio_pagamento
   - request_id: 17
     target_table: SC1
     date_parameter: C1_EMISSAO
