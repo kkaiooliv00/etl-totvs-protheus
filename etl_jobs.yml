@@ -70,3 +70,10 @@ jobs:
     target_table: ST6
   - request_id: 54
     target_table: ST4
+  - request_id: 55
+    target_table: ZZ1
+  - request_id: 56
+    target_table: ZZ2
+  - request_id: 57
+    target_table: SE1
+    date_parameter: E1_EMISSAO
