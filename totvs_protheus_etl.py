@@ -54,14 +54,16 @@ PAGE_SIZE = 200
 # ── Tuning ───────────────────────────────────────────────────────────────────
 # Requisicoes sequenciais — sem paralelismo (servidor TOTVS nao suporta).
 # Timeout de CONEXAO separado do timeout de LEITURA:
-#   - CONNECT_TIMEOUT_SECONDS (15s): tempo maximo para estabelecer o TCP/TLS.
-#     Curto de proposito — se o servidor nao aceitar a conexao logo, falha
-#     rapido e entra no retry exponencial, evitando travar por 60s.
+#   - CONNECT_TIMEOUT_SECONDS (45s): tempo maximo para estabelecer o TCP/TLS.
+#     Mais tolerante para execucoes completas no GitHub Actions, onde o
+#     endpoint TOTVS pode demorar para aceitar conexoes novas.
 #   - READ_TIMEOUT_SECONDS (90s): tempo maximo aguardando a resposta da API
 #     apos a conexao estar estabelecida. Maior pois algumas queries sao lentas.
-CONNECT_TIMEOUT_SECONDS = 15
+CONNECT_TIMEOUT_SECONDS = 45
 READ_TIMEOUT_SECONDS = 90
 REQUEST_RETRY_COUNT = 3
+REQUEST_BACKOFF_SECONDS = (10, 30, 60)
+SERVER_ERROR_BACKOFF_SECONDS = (15, 45, 90)
 
 # Pausa entre jobs consecutivos (segundos). Evita rate limiting / cooldown
 # do servidor TOTVS quando varias conexoes sao abertas em sequencia rapida.
@@ -283,7 +285,7 @@ def _fetch_page_sync(
                     f"HTTP {response.status_code}", response=response
                 )
                 if attempt <= REQUEST_RETRY_COUNT:
-                    wait = 4 * attempt  # backoff maior para erros de servidor
+                    wait = SERVER_ERROR_BACKOFF_SECONDS[attempt - 1]
                     logger.warning(
                         "%s | Erro 5xx pagina %s tentativa %s/%s; aguardando %ss.",
                         job.target_table, page, attempt, REQUEST_RETRY_COUNT + 1, wait,
@@ -316,7 +318,7 @@ def _fetch_page_sync(
 
         except (requests.RequestException, ValueError) as exc:
             if attempt <= REQUEST_RETRY_COUNT:
-                wait = 2 * attempt
+                wait = REQUEST_BACKOFF_SECONDS[attempt - 1]
                 logger.warning(
                     "%s | Falha pagina %s tentativa %s/%s; aguardando %ss. Erro: %s",
                     job.target_table, page, attempt, REQUEST_RETRY_COUNT + 1,

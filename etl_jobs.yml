@@ -77,3 +77,6 @@ jobs:
   - request_id: 57
     target_table: SE1
     date_parameter: E1_EMISSAO
+  - request_id: 58
+    target_table: SE5
+    date_parameter: E5_DATA
