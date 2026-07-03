@@ -61,7 +61,7 @@ jobs:
     target_table: NNR
   - request_id: 50
     target_table: STF
-    date_parameter: TF_DTULTIMA
+    date_parameter: TF_DTULTMA
   - request_id: 51
     target_table: STI
   - request_id: 52
