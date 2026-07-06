@@ -3,23 +3,40 @@ name: ETL TOTVS Protheus
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: >
+          Modo de execucao:
+          all_except_special = todas exceto ZZ1(55), ZZ2(56), SE1(57)
+          only_special = apenas ZZ1(55), ZZ2(56), SE1(57)
+          custom = apenas os IDs informados em custom_ids
+          all = todas as tabelas sem excecao
+        required: true
+        type: choice
+        default: "all_except_special"
+        options:
+          - all_except_special
+          - only_special
+          - custom
+          - all
+      custom_ids:
+        description: >
+          IDs para o modo "custom" — separados por virgula (ex: 17,22,55).
+          Ignorado nos outros modos.
+        required: false
+        type: string
+        default: ""
       lookback_days:
         description: >
           Dias de historico a sincronizar. Use 0 para carga total sem filtro de data.
         required: true
         type: string
         default: "7"
-      request_id:
-        description: >
-          request_id de uma tabela especifica. Use 0 para rodar todas.
-        required: true
-        type: string
-        default: "0"
   schedule:
     # Domingo, 01h00 Fortaleza/Recife (04h00 UTC).
     - cron: "0 4 * * 0"
     # Segunda a sexta, 01h00 Fortaleza/Recife (04h00 UTC).
     - cron: "0 4 * * 1-5"
+
 permissions:
   contents: read
 
@@ -47,13 +64,15 @@ jobs:
       - name: Instalar dependencias
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Resolver lookback_days
+      - name: Resolver parametros de execucao
         id: params
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
+            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
           else
             echo "lookback_days=30" >> "$GITHUB_OUTPUT"
+            echo "mode=all_except_special" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Executar ETL
@@ -62,11 +81,36 @@ jobs:
           API_PROTHEUS_PASSWORD: ${{ secrets.API_PROTHEUS_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          if [ -n "${{ inputs.request_id }}" ] && [ "${{ inputs.request_id }}" != "0" ]; then
-            python totvs_protheus_etl.py \
-              --lookback-days "${{ steps.params.outputs.lookback_days }}" \
-              --request-id "${{ inputs.request_id }}"
-          else
-            python totvs_protheus_etl.py \
-              --lookback-days "${{ steps.params.outputs.lookback_days }}"
-          fi
+          LOOKBACK="${{ steps.params.outputs.lookback_days }}"
+          MODE="${{ steps.params.outputs.mode }}"
+
+          case "$MODE" in
+            all_except_special)
+              echo "Modo: todas as tabelas excluindo ZZ1(55), ZZ2(56), SE1(57)"
+              python totvs_protheus_etl.py \
+                --lookback-days "$LOOKBACK" \
+                --exclude-request-ids "55,56,57"
+              ;;
+            only_special)
+              echo "Modo: apenas ZZ1(55), ZZ2(56), SE1(57)"
+              python totvs_protheus_etl.py \
+                --lookback-days "$LOOKBACK" \
+                --request-ids "55,56,57"
+              ;;
+            custom)
+              CUSTOM_IDS="${{ inputs.custom_ids }}"
+              if [ -z "$CUSTOM_IDS" ]; then
+                echo "Erro: modo 'custom' requer o campo custom_ids preenchido." >&2
+                exit 1
+              fi
+              echo "Modo: custom — IDs: $CUSTOM_IDS"
+              python totvs_protheus_etl.py \
+                --lookback-days "$LOOKBACK" \
+                --request-ids "$CUSTOM_IDS"
+              ;;
+            all|*)
+              echo "Modo: todas as tabelas"
+              python totvs_protheus_etl.py \
+                --lookback-days "$LOOKBACK"
+              ;;
+          esac

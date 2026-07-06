@@ -896,6 +896,34 @@ def filter_jobs_by_request_id(
     return selected
 
 
+def filter_jobs_by_request_ids(
+    jobs: list[EtlJob], ids: set[int]
+) -> list[EtlJob]:
+    """Retorna apenas os jobs cujo request_id esta na lista de inclusao.
+
+    Usado pelo modo --request-ids (plural) para selecionar um subconjunto
+    especifico de tabelas. Diferente de filter_jobs_by_request_id (singular),
+    aceita multiplos IDs e nao levanta erro se algum ID nao existir
+    (registra apenas um aviso).
+    """
+    if not ids:
+        return jobs
+    selected = [j for j in jobs if j.request_id in ids]
+    missing = ids - {j.request_id for j in selected}
+    if missing:
+        logger.warning(
+            "request_ids nao encontrados em etl_jobs.yml e serao ignorados: %s.",
+            ", ".join(str(i) for i in sorted(missing)),
+        )
+    if not selected:
+        available = ", ".join(str(j.request_id) for j in jobs)
+        raise RuntimeError(
+            f"Nenhum job encontrado para --request-ids={sorted(ids)}. "
+            f"IDs disponiveis: {available}"
+        )
+    return selected
+
+
 def parse_request_id_list(raw: str | None) -> set[int]:
     if not raw:
         return set()
@@ -939,6 +967,16 @@ def parse_args() -> argparse.Namespace:
         "--exclude-request-ids",
         default="",
         help="Lista separada por virgulas de request_ids a ignorar.",
+    )
+    parser.add_argument(
+        "--request-ids",
+        default="",
+        help=(
+            "Lista separada por virgulas de request_ids a executar "
+            "(modo inclusao). Se informado, apenas esses jobs rodam. "
+            "Tem prioridade sobre --exclude-request-ids. "
+            "Exemplos: '55,56,57' ou '17,22'."
+        ),
     )
     parser.add_argument(
         "--job-delay-seconds",
@@ -1025,10 +1063,18 @@ def main() -> None:
     lookback_days = None if args.lookback_days == 0 else args.lookback_days
 
     jobs = load_jobs()
-    jobs = filter_jobs_by_request_id(jobs, args.request_id or None)
-    jobs = exclude_jobs_by_request_ids(
-        jobs, parse_request_id_list(args.exclude_request_ids)
-    )
+
+    include_ids = parse_request_id_list(args.request_ids)
+    if include_ids:
+        # --request-ids tem prioridade: seleciona apenas esses IDs (ignora --exclude)
+        jobs = filter_jobs_by_request_ids(jobs, include_ids)
+    else:
+        # Fluxo legado: filtro por ID singular e depois exclusao
+        jobs = filter_jobs_by_request_id(jobs, args.request_id or None)
+        jobs = exclude_jobs_by_request_ids(
+            jobs, parse_request_id_list(args.exclude_request_ids)
+        )
+
     selected_jobs = chunk_jobs(jobs, args.chunk_index, args.chunk_size)
 
     if not selected_jobs:
