@@ -80,3 +80,6 @@ jobs:
   - request_id: 58
     target_table: SE5
     date_parameter: E5_DATA
+  - request_id: 59
+    target_table: zz1e2
+    date_parameter: ZZ1_DATA
