@@ -83,3 +83,5 @@ jobs:
   - request_id: 59
     target_table: zz1e2
     date_parameter: ZZ1_DATA
+  - request_id: 13
+    target_table: SYS_COMPANY_FILIAIS
