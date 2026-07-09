@@ -31,11 +31,7 @@ on:
         required: true
         type: string
         default: "7"
-  schedule:
-    # Domingo, 01h00 Fortaleza/Recife (04h00 UTC).
-    - cron: "0 4 * * 0"
-    # Segunda a sexta, 01h00 Fortaleza/Recife (04h00 UTC).
-    - cron: "0 4 * * 1-5"
+
 
 permissions:
   contents: read
@@ -67,13 +63,8 @@ jobs:
       - name: Resolver parametros de execucao
         id: params
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
-            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "lookback_days=30" >> "$GITHUB_OUTPUT"
-            echo "mode=all_except_special" >> "$GITHUB_OUTPUT"
-          fi
+          echo "lookback_days=${{ inputs.lookback_days }}" >> "$GITHUB_OUTPUT"
+          echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
 
       - name: Executar ETL
         env:
